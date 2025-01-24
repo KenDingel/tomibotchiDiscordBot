@@ -13,7 +13,8 @@ from database.database import get_pet_stats, update_pet_stats
 # Configure logging
 logger = logging.getLogger(__name__)
 
-class PetState(Enum):
+# Change the Enum class name from PetState to PetStatus
+class PetStatus(Enum):
     NORMAL = "normal"
     SLEEPING = "sleeping"
     SICK = "sick"
@@ -91,7 +92,6 @@ INTERACTION_EFFECTS = {
 
 class AtomicCounter:
     """Thread-safe counter for tracking atomic operations."""
-    
     def __init__(self):
         self._value = 0
         self._lock = asyncio.Lock()
@@ -104,594 +104,1517 @@ class AtomicCounter:
     async def get_value(self) -> int:
         async with self._lock:
             return self._value
-
-class PetStateManager:
-    """Manages individual pet state and handles stat calculations."""
-    
-    def __init__(self, pet_id: int, initial_stats: Dict[str, Any]):
-        """
-        Initialize pet state manager.
-        
-        Args:
-            pet_id: Unique identifier for the pet
-            initial_stats: Dictionary containing pet's initial stats
-        """
+            
+class PetState:
+    def __init__(self, pet_id: int, name: str, species: str, stats: Dict[str, int]):
+        """Initialize pet state."""
         self.pet_id = pet_id
-        self.name = initial_stats['name']
-        self.species = initial_stats['species']
-        self.stats = initial_stats['stats'].copy()
-        self._state = PetState.NORMAL  # Private state variable
-        self._state_lock = asyncio.Lock()  # Lock for state transitions
-        self._stats_lock = asyncio.Lock()  # Lock for stats modifications
-        self.last_update = initial_stats['last_update']
-        self.interaction_history: Dict[InteractionType, datetime] = {}
-        self.treat_count = 0
-        self.last_treat_reset = datetime.now(timezone.utc)
-        self._operation_counter = AtomicCounter()
-        self._pending_changes: Dict[int, Dict[str, Any]] = {}
-        self._last_verified_state: Optional[Dict[str, Any]] = None
-        self._last_persistence_time = datetime.now(timezone.utc)
-
-    @property
-    async def state(self) -> PetState:
-        """Thread-safe getter for pet state."""
-        async with self._state_lock:
-            return self._state
-
-    @state.setter
-    async def state(self, new_state: PetState) -> None:
-        """Thread-safe setter for pet state."""
-        async with self._state_lock:
-            if new_state != self._state:
-                old_state = self._state
-                self._state = new_state
-                await self._on_state_change(old_state, new_state)
-
-    async def _on_state_change(self, old_state: PetState, new_state: PetState) -> None:
-        """Handles state transition events and notifications."""
-        event = PetStateEvent(
-            pet_id=self.pet_id,
-            old_state=old_state,
-            new_state=new_state,
-            stats_snapshot=self.stats.copy(),
-            timestamp=datetime.now(timezone.utc)
-        )
-        # Queue state change event
-        self._state_change_buffer[await self._operation_counter.increment()] = event
-        
-        # Persist state change immediately
-        await self._persist_stats()
-    
-    async def update(self) -> None:
-        """Updates pet stats based on time elapsed since last update."""
-        async with self._lock:
-            try:
-                now = datetime.now(timezone.utc)
-                elapsed_hours = (now - self.last_update).total_seconds() / 3600
-                
-                # Reset daily treat count if needed
-                if (now - self.last_treat_reset).total_seconds() >= 86400:  # 24 hours
-                    self.treat_count = 0
-                    self.last_treat_reset = now
-                
-                # Calculate and apply decay
-                decay = self._calculate_decay(elapsed_hours)
-                self._apply_stat_changes(decay)
-                
-                # Update state and persist changes
-                self.state = self._calculate_state()
-                await self._persist_stats()
-                self.last_update = now
-                
-            except Exception as e:
-                logger.error(f"Error updating pet {self.pet_id}: {e}")
-                logger.error(traceback.format_exc())
-                raise
-    
-    def _calculate_decay(self, elapsed_hours: float) -> Dict[str, float]:
-        """
-        Calculates stat decay based on elapsed time and current state.
-        
-        Args:
-            elapsed_hours: Number of hours since last update
-            
-        Returns:
-            Dictionary of stat changes
-        """
-        base_decay = {
-            'hunger': -2 * elapsed_hours,
-            'hygiene': -3 * elapsed_hours,
-            'happiness': -1 * elapsed_hours
-        }
-        
-        # Energy changes based on sleep state
-        if self.state == PetState.SLEEPING:
-            base_decay['energy'] = 10 * elapsed_hours  # Regenerate while sleeping
-        else:
-            base_decay['energy'] = -5 * elapsed_hours  # Deplete while awake
-        
-        # Apply state-based modifiers
-        if self.state == PetState.SICK:
-            base_decay['happiness'] *= 1.5  # Faster happiness decay when sick
-            base_decay['energy'] *= 1.2  # More energy drain when sick
-        
-        # Additional happiness decay if basic needs aren't met
-        if any(self.stats[stat] < 20 for stat in ['hunger', 'energy', 'hygiene']):
-            base_decay['happiness'] -= 2 * elapsed_hours
-        
-        return base_decay
-    
-    def _calculate_state(self) -> PetState:
-        """
-        Determines pet state based on current stats.
-        
-        Returns:
-            Current PetState enum value
-        """
-        if self.stats['energy'] < 20:
-            return PetState.SLEEPING
-        elif self.stats['hygiene'] < 30 or self.stats['hunger'] < 20:
-            return PetState.SICK
-        elif self.stats['happiness'] < 25:
-            return PetState.UNHAPPY
-        return PetState.NORMAL
-    
-    async def _persist_stats(self) -> None:
-        """
-        Persists current stats to database with verification.
-        
-        Raises:
-            PersistenceError: If persistence or verification fails
-        """
-        class PersistenceError(Exception):
-            pass
-
-        try:
-            async with self._stats_lock:
-                # Get current operation count for verification
-                op_count = await self._operation_counter.get_value()
-                
-                # Create persistence snapshot
-                snapshot = {
-                    'stats': self.stats.copy(),
-                    'state': await self.state,
-                    'op_count': op_count,
-                    'timestamp': datetime.now(timezone.utc)
-                }
-                
-                # Persist to database
-                success = await asyncio.to_thread(
-                    update_pet_stats,
-                    self.pet_id,
-                    self.stats
-                )
-                if not success:
-                    raise PersistenceError("Failed to persist pet stats")
-                
-                # Verify persistence
-                stored_stats = await asyncio.to_thread(get_pet_stats, self.pet_id)
-                if not stored_stats or not self._verify_stats(stored_stats['stats']):
-                    raise PersistenceError("Stats verification failed")
-                
-                # Update persistence tracking
-                self._last_verified_state = snapshot
-                self._last_persistence_time = snapshot['timestamp']
-                
-                # Clear processed state changes
-                pending_changes = {
-                    k: v for k, v in self._state_change_buffer.items()
-                    if k > op_count
-                }
-                self._state_change_buffer = pending_changes
-                
-        except Exception as e:
-            logger.error(f"Error persisting stats for pet {self.pet_id}: {e}")
-            logger.error(traceback.format_exc())
-            raise
-
-    def _verify_stats(self, stored_stats: Dict[str, int]) -> bool:
-        """
-        Verifies stored stats match current stats within tolerance.
-        
-        Args:
-            stored_stats: Stats retrieved from database
-            
-        Returns:
-            bool: True if verification passes
-        """
-        TOLERANCE = 0.01  # 1% tolerance for floating point comparison
-        
-        for stat, value in self.stats.items():
-            if stat not in stored_stats:
-                return False
-            stored_value = stored_stats[stat]
-            if abs(value - stored_value) > (value * TOLERANCE):
-                logger.error(
-                    f"Stat verification failed for {stat}. "
-                    f"Current: {value}, Stored: {stored_value}"
-                )
-                return False
-        return True
-
-    async def _update_stats_atomic(self, changes: Dict[str, float]) -> None:
-        """
-        Applies stat changes atomically with verification.
-        
-        Args:
-            changes: Dictionary of stat changes to apply
-        """
-        async with self._stats_lock:
-            # Record operation for tracking
-            op_id = await self._operation_counter.increment()
-            
-            # Store original stats for rollback
-            original_stats = self.stats.copy()
-            
-            try:
-                # Apply changes
-                for stat, change in changes.items():
-                    if stat in self.stats:
-                        new_value = max(0, min(100, self.stats[stat] + change))
-                        self.stats[stat] = new_value
-                
-                # Calculate new state
-                new_state = self._calculate_state()
-                if new_state != await self.state:
-                    await self.set_state(new_state)
-                
-                # Record pending change
-                self._pending_changes[op_id] = {
-                    'changes': changes,
-                    'original_stats': original_stats,
-                    'new_stats': self.stats.copy(),
-                    'timestamp': datetime.now(timezone.utc)
-                }
-                
-            except Exception as e:
-                # Rollback on error
-                self.stats = original_stats
-                logger.error(f"Error updating stats for pet {self.pet_id}: {e}")
-                raise
-
-    async def process_interaction(
-        self,
-        interaction_type: InteractionType
-    ) -> Tuple[bool, str]:
-        """
-        Processes a user interaction with the pet.
-        
-        Args:
-            interaction_type: Type of interaction to process
-            
-        Returns:
-            Tuple of (success, message)
-        """
-        if interaction_type not in INTERACTION_EFFECTS:
-            return False, "Invalid interaction type"
-            
-        async with self._lock:
-            try:
-                effect = INTERACTION_EFFECTS[interaction_type]
-                
-                # Validate interaction
-                if not await self._check_cooldown(interaction_type):
-                    return False, "This interaction is on cooldown"
-                
-                if not self._validate_conditions(effect):
-                    return False, self._get_failure_message(effect)
-                
-                # Process treat count
-                if interaction_type == InteractionType.TREAT:
-                    self.treat_count += 1
-                
-                # Apply effects
-                changes = {
-                    'happiness': effect.happiness,
-                    'hunger': effect.hunger,
-                    'energy': effect.energy,
-                    'hygiene': effect.hygiene
-                }
-                
-                self._apply_stat_changes(changes)
-                self.state = self._calculate_state()
-                
-                # Record interaction
-                self.interaction_history[interaction_type] = datetime.now(timezone.utc)
-                
-                # Persist changes
-                await self._persist_stats()
-                
-                return True, "Interaction successful!"
-                
-            except Exception as e:
-                logger.error(f"Error processing interaction for pet {self.pet_id}: {e}")
-                return False, f"An error occurred: {str(e)}"
-
-    async def _check_cooldown(self, interaction_type: InteractionType) -> bool:
-        """
-        Checks if an interaction is on cooldown.
-        
-        Args:
-            interaction_type: Type of interaction to check
-            
-        Returns:
-            bool: True if interaction is available, False if on cooldown
-        """
-        if interaction_type not in self.interaction_history:
-            return True
-            
-        last_time = self.interaction_history[interaction_type]
-        cooldown = INTERACTION_EFFECTS[interaction_type].cooldown
-        return datetime.now(timezone.utc) - last_time >= cooldown
-
-    def _validate_conditions(self, effect: InteractionEffect) -> bool:
-        """
-        Validates all conditions for an interaction.
-        
-        Args:
-            effect: InteractionEffect to validate
-            
-        Returns:
-            bool: True if all conditions are met
-        """
-        conditions = effect.conditions
-        
-        # Check sleeping conditions
-        if conditions.get("not_sleeping") and self.state == PetState.SLEEPING:
-            return False
-        if conditions.get("is_sleeping") and self.state != PetState.SLEEPING:
-            return False
-            
-        # Check stat-based conditions
-        if "max_hunger" in conditions and self.stats['hunger'] >= conditions["max_hunger"]:
-            return False
-        if "min_energy" in conditions and self.stats['energy'] < conditions["min_energy"]:
-            return False
-        if "max_energy" in conditions and self.stats['energy'] >= conditions["max_energy"]:
-            return False
-            
-        # Check treat limit
-        if "max_treats_per_day" in conditions and self.treat_count >= conditions["max_treats_per_day"]:
-            return False
-            
-        # Check sick condition
-        if conditions.get("is_sick") and self.state != PetState.SICK:
-            return False
-            
-        return True
-
-    def _get_failure_message(self, effect: InteractionEffect) -> str:
-        """Generates appropriate failure message based on conditions."""
-        conditions = effect.conditions
-        
-        if conditions.get("not_sleeping") and self.state == PetState.SLEEPING:
-            return "Pet is sleeping"
-        if conditions.get("is_sleeping") and self.state != PetState.SLEEPING:
-            return "Pet must be sleeping for this interaction"
-        if "max_treats_per_day" in conditions and self.treat_count >= conditions["max_treats_per_day"]:
-            return "Daily treat limit reached"
-        if "is_sick" in conditions and self.state != PetState.SICK:
-            return "Pet must be sick to use medicine"
-            
-        return "Interaction conditions not met"
-
-from collections import OrderedDict
-from dataclasses import dataclass
-from typing import Optional, Set, Callable, Awaitable
-
-@dataclass
-class PetStateEvent:
-    """Event data for pet state changes."""
-    pet_id: int
-    old_state: Optional[PetState]
-    new_state: PetState
-    stats_snapshot: Dict[str, int]
-    timestamp: datetime
-
-class EventType(Enum):
-    """Types of events that can be emitted by the state system."""
-    STATE_CHANGE = "state_change"
-    STATS_CRITICAL = "stats_critical"
-    EVOLUTION_READY = "evolution_ready"
-    ERROR = "error"
-
-class LRUCache(OrderedDict):
-    """Size-limited LRU cache implementation."""
-    
-    def __init__(self, maxsize: int = 1000, *args, **kwargs):
-        self.maxsize = maxsize
-        super().__init__(*args, **kwargs)
-
-    def __setitem__(self, key, value):
-        super().__setitem__(key, value)
-        self.move_to_end(key)
-        if len(self) > self.maxsize:
-            oldest = next(iter(self))
-            del self[oldest]
-
-class StateManager:
-    """Manages collection of pet states and coordinates updates."""
-    
-    def __init__(self, 
-                 cache_timeout: int = 3600,
-                 max_cache_size: int = 1000):
-        """
-        Initialize state manager.
-        
-        Args:
-            cache_timeout: Time in seconds before cached pet states are cleaned up
-            max_cache_size: Maximum number of pets to keep in cache
-        """
-        self._pet_states = LRUCache(maxsize=max_cache_size)
-        self._cache_timeout = cache_timeout
-        self._last_access: Dict[int, datetime] = {}
+        self.name = name
+        self.species = species
+        self.stats = stats
+        self._state = PetStatus.NORMAL  # Update to use PetStatus enum
         self._lock = asyncio.Lock()
-        self._event_handlers: Dict[EventType, Set[Callable[[Any], Awaitable[None]]]] = {
-            event_type: set() for event_type in EventType
-        }
-        self._state_change_buffer: Dict[int, PetStateEvent] = {}
-    
-    async def load_pet(self, pet_id: int) -> Optional[PetStateManager]:
-        """
-        Loads or retrieves a pet's state from cache.
-        
-        Args:
-            pet_id: ID of pet to load
-            
-        Returns:
-            PetStateManager instance if successful, None if failed
-        """
+        self.last_update = datetime.now(timezone.utc)
+        self.interaction_history = {}
+    @property
+    def state(self) -> PetStatus:
+        """Get current pet state."""
+        return self._state
+    async def set_state(self, new_state: PetStatus) -> None:
+        """Thread-safe setter for pet state."""
         async with self._lock:
-            try:
-                # Check cache first
-                if pet_id in self._pet_states:
-                    self._last_access[pet_id] = datetime.now(timezone.utc)
-                    await self._pet_states[pet_id].update()  # Ensure stats are current
-                    return self._pet_states[pet_id]
-                
-                # Load from database
-                stats = await asyncio.to_thread(get_pet_stats, pet_id)
-                if not stats:
-                    logger.error(f"Failed to load stats for pet {pet_id}")
-                    return None
-                
-                # Create new state manager
-                pet_state = PetStateManager(pet_id, stats)
-                self._pet_states[pet_id] = pet_state
-                self._last_access[pet_id] = datetime.now(timezone.utc)
-                
-                return pet_state
-                
-            except Exception as e:
-                logger.error(f"Error loading pet {pet_id}: {e}")
-                logger.error(traceback.format_exc())
-                return None
-    
-    async def update_all(self) -> Dict[int, Optional[Exception]]:
-        """
-        Updates all cached pet states with improved error handling.
-        
-        Returns:
-            Dict mapping pet_id to Exception if update failed, None if successful
-        """
-        async with self._lock:
-            results = {}
-            update_tasks = {
-                pet_id: asyncio.create_task(state.update())
-                for pet_id, state in self._pet_states.items()
-            }
-            
-            # Wait for all updates to complete
-            for pet_id, task in update_tasks.items():
-                try:
-                    await task
-                    results[pet_id] = None
-                except Exception as e:
-                    logger.error(f"Error updating pet {pet_id}: {e}")
-                    results[pet_id] = e
-                    await self._emit_event(EventType.ERROR, {
-                        'pet_id': pet_id,
-                        'error': e,
-                        'operation': 'update'
-                    })
-                    
-                    # Try to recover pet state from database
-                    try:
-                        self._pet_states[pet_id] = await self._recover_pet_state(pet_id)
-                    except Exception as recover_err:
-                        logger.error(f"Failed to recover pet {pet_id}: {recover_err}")
-            
-            return results
-    
-    async def cleanup_cache(self) -> None:
-        """Removes stale pet states from cache."""
+            self._state = new_state
+    async def update(self) -> None:
+        """Update pet stats based on time elapsed."""
         async with self._lock:
             now = datetime.now(timezone.utc)
-            stale_pets = [
-                pet_id for pet_id, last_access in self._last_access.items()
-                if (now - last_access).total_seconds() > self._cache_timeout
-            ]
+            time_elapsed = (now - self.last_update).total_seconds()
             
-            for pet_id in stale_pets:
-                try:
-                    # Ensure final state is persisted before removing
-                    if pet_id in self._pet_states:
-                        await self._pet_states[pet_id].update()
-                    del self._pet_states[pet_id]
-                    del self._last_access[pet_id]
-                    logger.info(f"Removed stale pet state for pet {pet_id}")
-                except Exception as e:
-                    logger.error(f"Error cleaning up pet {pet_id}: {e}")
-    
-    @asynccontextmanager
-    async def get_pet_state(self, pet_id: int) -> Optional[PetStateManager]:
-        """
-        Context manager for safely accessing pet state.
+            # Update stats based on time elapsed (every hour)
+            hours_elapsed = time_elapsed / 3600
+            if hours_elapsed >= 1:
+                # Decrease stats over time
+                self.stats['hunger'] = max(0, self.stats['hunger'] - int(5 * hours_elapsed))
+                self.stats['energy'] = max(0, self.stats['energy'] - int(3 * hours_elapsed))
+                self.stats['hygiene'] = max(0, self.stats['hygiene'] - int(4 * hours_elapsed))
+                self.stats['happiness'] = max(0, self.stats['happiness'] - int(2 * hours_elapsed))
+                
+                # Update state based on stats
+                if self.stats['hygiene'] < 30:
+                    await self.set_state(PetStatus.SICK)
+                elif self.stats['happiness'] < 30:
+                    await self.set_state(PetStatus.UNHAPPY)
+                else:
+                    await self.set_state(PetStatus.NORMAL)
+                
+                self.last_update = now
+class PetStateManager:
+    """Manages pet states and handles stat calculations."""
+    def __init__(self):
+        self._pet_states = {}
+        self._lock = asyncio.Lock()
+        self._operation_counter = AtomicCounter()
         
-        Args:
-            pet_id: ID of pet to access
-            
-        Yields:
-            PetStateManager instance if successful, None if failed
-            
-        Example:
-            async with state_manager.get_pet_state(pet_id) as pet:
-                if pet:
-                    await pet.process_interaction(InteractionType.FEED)
-        """
-        state = await self.load_pet(pet_id)
-        if not state:
-            yield None
-            return
-            
+    async def get_pet_state(self, pet_id: int) -> Optional[PetState]:
+        """Get or create a pet state for the given pet ID."""
         try:
-            yield state
-        finally:
-            self._last_access[pet_id] = datetime.now(timezone.utc)
-    
-    async def force_update(self, pet_id: int) -> bool:
-        """
-        Forces an immediate update of a specific pet's state.
+            async with self._lock:
+                if pet_id not in self._pet_states:
+                    # Load pet data from database
+                    pet_data = get_pet_stats(pet_id)
+                    if not pet_data:
+                        logger.error(f"Failed to load stats for pet {pet_id}")
+                        return None
+                    
+                    # Create new pet state
+                    self._pet_states[pet_id] = PetState(
+                        pet_id=pet_id,
+                        name=pet_data['name'],
+                        species=pet_data['species'],
+                        stats=pet_data['stats']
+                    )
+                
+                return self._pet_states[pet_id]
+                
+        except Exception as e:
+            logger.error(f"Error getting pet state: {e}")
+            logger.error(traceback.format_exc())
+            return None
+        if pet_id not in self.states:
+            # Load initial stats from database or use defaults
+            initial_stats = await self.load_pet_stats(pet_id)
+            self.states[pet_id] = PetState(pet_id, initial_stats)
+        return self.states[pet_id]
         
-        Args:
-            pet_id: ID of pet to update
-            
-        Returns:
-            bool: True if update successful, False otherwise
-        """
-        async with self._lock:
-            if pet_id not in self._pet_states:
-                return False
-                
-            try:
-                await self._pet_states[pet_id].update()
-                return True
-            except Exception as e:
-                logger.error(f"Error force updating pet {pet_id}: {e}")
-                return False
+    async def load_pet_stats(self, pet_id: int):
+        """Load pet stats from database"""
+        # Implement database loading logic here
+        # For now, return default stats
+        return {
+            'hunger': 100,
+            'happiness': 100,
+            'energy': 100,
+            'hygiene': 100
+        }
+
+@dataclass
+class InteractionEffect:
+    """Defines the effects and requirements of a pet interaction."""
+    happiness: int
+    hunger: int
+    energy: int
+    hygiene: int
+    cooldown: timedelta
+    conditions: Dict[str, Any]
+    """Thread-safe counter for tracking atomic operations."""
+    def __init__(self):
+        self._value = 0
+        self._lock = asyncio.Lock()
     
-    async def remove_pet(self, pet_id: int) -> bool:
-        """
-        Removes a pet from the cache.
-        
-        Args:
-            pet_id: ID of pet to remove
-            
-        Returns:
-            bool: True if pet was removed, False if not found
-        """
+    async def increment(self) -> int:
         async with self._lock:
-            if pet_id not in self._pet_states:
-                return False
+            self._value += 1
+            return self._value
+    
+    async def get_value(self) -> int:
+        async with self._lock:
+            return self._value
+        class PetStateManager:
+            """Manages individual pet state and handles stat calculations."""
+            def __init__(self, pet_id: int, initial_stats: Dict[str, Any]):
+                """
+                Initialize pet state manager.
                 
-            try:
-                # Ensure final state is persisted
-                await self._pet_states[pet_id].update()
+                Args:
+                    pet_id: Unique identifier for the pet
+                    initial_stats: Dictionary containing pet's initial stats
+                """
+                self.pet_id = pet_id
+                self.name = initial_stats['name']
+                self.species = initial_stats['species']
+                self.stats = initial_stats['stats'].copy()
+                self._state = PetState.NORMAL  # Private state variable
+                self._state_lock = asyncio.Lock()  # Lock for state transitions
+                self._stats_lock = asyncio.Lock()  # Lock for stats modifications
+                self.last_update = initial_stats['last_update']
+                self.interaction_history: Dict[InteractionType, datetime] = {}
+                self.treat_count = 0
+                self.last_treat_reset = datetime.now(timezone.utc)
+                self._operation_counter = AtomicCounter()
+                self._pending_changes: Dict[int, Dict[str, Any]] = {}
+                self._last_verified_state: Optional[Dict[str, Any]] = None
+                self._last_persistence_time = datetime.now(timezone.utc)
+                self._lock = asyncio.Lock()  # Add lock attribute
+                def __init__(self, pet_id: int, initial_stats: Dict[str, Any]):
+                    """
+                    Initialize pet state manager.
+                    
+                    Args:
+                        pet_id: Unique identifier for the pet
+                        initial_stats: Dictionary containing pet's initial stats
+                    """
+                    self.pet_id = pet_id
+                    self.name = initial_stats['name']
+                    self.species = initial_stats['species']
+                    self.stats = initial_stats['stats'].copy()
+                    self._state = PetState.NORMAL  # Private state variable
+                    self._state_lock = asyncio.Lock()  # Lock for state transitions
+                    self._stats_lock = asyncio.Lock()  # Lock for stats modifications
+                    self.last_update = initial_stats['last_update']
+                    self.interaction_history: Dict[InteractionType, datetime] = {}
+                    self.treat_count = 0
+                    self.last_treat_reset = datetime.now(timezone.utc)
+                    self._operation_counter = AtomicCounter()
+                    self._pending_changes: Dict[int, Dict[str, Any]] = {}
+                    self._last_verified_state: Optional[Dict[str, Any]] = None
+                    self._last_persistence_time = datetime.now(timezone.utc)
+                    self._lock = asyncio.Lock()  # Add lock attribute
+                    class PetStateManager:
+                        """Initialize the pet state manager."""
+                        self._pet_states = {}
+                        self._lock = asyncio.Lock()
+                    
+                    async def get_pet_state(self, pet_id: int) -> Optional[PetState]:
+                        """Get or create a pet state for the given pet ID."""
+                        try:
+                            async with self._lock:
+                                if pet_id not in self._pet_states:
+                                    # Load pet data from database
+                                    pet_data = get_pet_stats(pet_id)
+                                    if not pet_data:
+                                        logger.error(f"Failed to load stats for pet {pet_id}")
+                                        return None
+                                    
+                                    # Create new pet state
+                                    self._pet_states[pet_id] = PetState(
+                                        pet_id=pet_id,
+                                        name=pet_data['name'],
+                                        species=pet_data['species'],
+                                        stats=pet_data['stats']
+                                    )
+                                
+                                return self._pet_states[pet_id]
+                                
+                        except Exception as e:
+                            logger.error(f"Error getting pet state: {e}")
+                            logger.error(traceback.format_exc())
+class PetState:
+    def __init__(self, pet_id: int, name: str, species: str, stats: Dict[str, int]):
+        """Initialize pet state."""
+        self.pet_id = pet_id
+        self.name = name
+        self.species = species
+        self.stats = stats
+        self._state = PetStatus.NORMAL  # Update to use PetStatus enum
+        self._lock = asyncio.Lock()
+        self.last_update = datetime.now(timezone.utc)
+        self.interaction_history = {}
+    @property
+    def state(self) -> PetStatus:
+        """Get current pet state."""
+        return self._state
+    async def set_state(self, new_state: PetStatus) -> None:
+        """Thread-safe setter for pet state."""
+        async with self._lock:
+            self._state = new_state
+    async def update(self) -> None:
+        """Update pet stats based on time elapsed."""
+        async with self._lock:
+            now = datetime.now(timezone.utc)
+            time_elapsed = (now - self.last_update).total_seconds()
+            
+            # Update stats based on time elapsed (every hour)
+            hours_elapsed = time_elapsed / 3600
+            if hours_elapsed >= 1:
+                # Decrease stats over time
+                self.stats['hunger'] = max(0, self.stats['hunger'] - int(5 * hours_elapsed))
+                self.stats['energy'] = max(0, self.stats['energy'] - int(3 * hours_elapsed))
+                self.stats['hygiene'] = max(0, self.stats['hygiene'] - int(4 * hours_elapsed))
+                self.stats['happiness'] = max(0, self.stats['happiness'] - int(2 * hours_elapsed))
                 
-                del self._pet_states[pet_id]
-                del self._last_access[pet_id]
-                logger.info(f"Manually removed pet {pet_id} from cache")
-                return True
-            except Exception as e:
-                logger.error(f"Error removing pet {pet_id}: {e}")
-                return False
+                # Update state based on stats
+                if self.stats['hygiene'] < 30:
+                    await self.set_state(PetStatus.SICK)
+                elif self.stats['happiness'] < 30:
+                    await self.set_state(PetStatus.UNHAPPY)
+                else:
+                    await self.set_state(PetStatus.NORMAL)
+                
+                self.last_update = now
+class PetStateManager:
+    """Manages pet states and handles stat calculations."""
+    def __init__(self):
+        self._pet_states = {}
+        self._lock = asyncio.Lock()
+        self._operation_counter = AtomicCounter()
+        
+    async def get_pet_state(self, pet_id: int) -> Optional[PetState]:
+        """Get or create a pet state for the given pet ID."""
+        try:
+            async with self._lock:
+                if pet_id not in self._pet_states:
+                    # Load pet data from database
+                    pet_data = get_pet_stats(pet_id)
+                    if not pet_data:
+                        logger.error(f"Failed to load stats for pet {pet_id}")
+                        return None
+                    
+                    # Create new pet state
+                    self._pet_states[pet_id] = PetState(
+                        pet_id=pet_id,
+                        name=pet_data['name'],
+                        species=pet_data['species'],
+                        stats=pet_data['stats']
+                    )
+                
+                return self._pet_states[pet_id]
+                
+        except Exception as e:
+            logger.error(f"Error getting pet state: {e}")
+            logger.error(traceback.format_exc())
+            return None
+        if pet_id not in self.states:
+            # Load initial stats from database or use defaults
+            initial_stats = await self.load_pet_stats(pet_id)
+            self.states[pet_id] = PetState(pet_id, initial_stats)
+        return self.states[pet_id]
+        
+    async def load_pet_stats(self, pet_id: int):
+        """Load pet stats from database"""
+        # Implement database loading logic here
+        # For now, return default stats
+        return {
+            'hunger': 100,
+            'happiness': 100,
+            'energy': 100,
+            'hygiene': 100
+        }
+
+@dataclass
+class InteractionEffect:
+    """Defines the effects and requirements of a pet interaction."""
+    happiness: int
+    hunger: int
+    energy: int
+    hygiene: int
+    cooldown: timedelta
+    conditions: Dict[str, Any]
+    """Thread-safe counter for tracking atomic operations."""
+    def __init__(self):
+        self._value = 0
+        self._lock = asyncio.Lock()
+    
+    async def increment(self) -> int:
+        async with self._lock:
+            self._value += 1
+            return self._value
+    
+    async def get_value(self) -> int:
+        async with self._lock:
+            return self._value
+        class PetStateManager:
+            """Manages individual pet state and handles stat calculations."""
+            def __init__(self, pet_id: int, initial_stats: Dict[str, Any]):
+                """
+                Initialize pet state manager.
+                
+                Args:
+                    pet_id: Unique identifier for the pet
+                    initial_stats: Dictionary containing pet's initial stats
+                """
+                self.pet_id = pet_id
+                self.name = initial_stats['name']
+                self.species = initial_stats['species']
+                self.stats = initial_stats['stats'].copy()
+                self._state = PetState.NORMAL  # Private state variable
+                self._state_lock = asyncio.Lock()  # Lock for state transitions
+                self._stats_lock = asyncio.Lock()  # Lock for stats modifications
+                self.last_update = initial_stats['last_update']
+                self.interaction_history: Dict[InteractionType, datetime] = {}
+                self.treat_count = 0
+                self.last_treat_reset = datetime.now(timezone.utc)
+                self._operation_counter = AtomicCounter()
+                self._pending_changes: Dict[int, Dict[str, Any]] = {}
+                self._last_verified_state: Optional[Dict[str, Any]] = None
+                self._last_persistence_time = datetime.now(timezone.utc)
+                self._lock = asyncio.Lock()  # Add lock attribute
+                def __init__(self, pet_id: int, initial_stats: Dict[str, Any]):
+                    """
+                    Initialize pet state manager.
+                    
+                    Args:
+                        pet_id: Unique identifier for the pet
+                        initial_stats: Dictionary containing pet's initial stats
+                    """
+                    self.pet_id = pet_id
+                    self.name = initial_stats['name']
+                    self.species = initial_stats['species']
+                    self.stats = initial_stats['stats'].copy()
+                    self._state = PetState.NORMAL  # Private state variable
+                    self._state_lock = asyncio.Lock()  # Lock for state transitions
+                    self._stats_lock = asyncio.Lock()  # Lock for stats modifications
+                    self.last_update = initial_stats['last_update']
+                    self.interaction_history: Dict[InteractionType, datetime] = {}
+                    self.treat_count = 0
+                    self.last_treat_reset = datetime.now(timezone.utc)
+                    self._operation_counter = AtomicCounter()
+                    self._pending_changes: Dict[int, Dict[str, Any]] = {}
+                    self._last_verified_state: Optional[Dict[str, Any]] = None
+                    self._last_persistence_time = datetime.now(timezone.utc)
+                    self._lock = asyncio.Lock()  # Add lock attribute
+                    class PetStateManager:
+                        """Initialize the pet state manager."""
+                        self._pet_states = {}
+                        self._lock = asyncio.Lock()
+                    
+                    async def get_pet_state(self, pet_id: int) -> Optional[PetState]:
+                        """Get or create a pet state for the given pet ID."""
+                        try:
+                            async with self._lock:
+                                if pet_id not in self._pet_states:
+                                    # Load pet data from database
+                                    pet_data = get_pet_stats(pet_id)
+                                    if not pet_data:
+                                        logger.error(f"Failed to load stats for pet {pet_id}")
+                                        return None
+                                    
+                                    # Create new pet state
+                                    self._pet_states[pet_id] = PetState(
+                                        pet_id=pet_id,
+                                        name=pet_data['name'],
+                                        species=pet_data['species'],
+                                        stats=pet_data['stats']
+                                    )
+                                
+                                return self._pet_states[pet_id]
+                                
+                        except Exception as e:
+                            logger.error(f"Error getting pet state: {e}")
+                            logger.error(traceback.format_exc())
+class PetState:
+    def __init__(self, pet_id: int, name: str, species: str, stats: Dict[str, int]):
+        """Initialize pet state."""
+        self.pet_id = pet_id
+        self.name = name
+        self.species = species
+        self.stats = stats
+        self._state = PetStatus.NORMAL  # Update to use PetStatus enum
+        self._lock = asyncio.Lock()
+        self.last_update = datetime.now(timezone.utc)
+        self.interaction_history = {}
+    @property
+    def state(self) -> PetStatus:
+        """Get current pet state."""
+        return self._state
+    async def set_state(self, new_state: PetStatus) -> None:
+        """Thread-safe setter for pet state."""
+        async with self._lock:
+            self._state = new_state
+    async def update(self) -> None:
+        """Update pet stats based on time elapsed."""
+        async with self._lock:
+            now = datetime.now(timezone.utc)
+            time_elapsed = (now - self.last_update).total_seconds()
+            
+            # Update stats based on time elapsed (every hour)
+            hours_elapsed = time_elapsed / 3600
+            if hours_elapsed >= 1:
+                # Decrease stats over time
+                self.stats['hunger'] = max(0, self.stats['hunger'] - int(5 * hours_elapsed))
+                self.stats['energy'] = max(0, self.stats['energy'] - int(3 * hours_elapsed))
+                self.stats['hygiene'] = max(0, self.stats['hygiene'] - int(4 * hours_elapsed))
+                self.stats['happiness'] = max(0, self.stats['happiness'] - int(2 * hours_elapsed))
+                
+                # Update state based on stats
+                if self.stats['hygiene'] < 30:
+                    await self.set_state(PetStatus.SICK)
+                elif self.stats['happiness'] < 30:
+                    await self.set_state(PetStatus.UNHAPPY)
+                else:
+                    await self.set_state(PetStatus.NORMAL)
+                
+                self.last_update = now
+class PetStateManager:
+    """Manages pet states and handles stat calculations."""
+    def __init__(self):
+        self._pet_states = {}
+        self._lock = asyncio.Lock()
+        self._operation_counter = AtomicCounter()
+        
+    async def get_pet_state(self, pet_id: int) -> Optional[PetState]:
+        """Get or create a pet state for the given pet ID."""
+        try:
+            async with self._lock:
+                if pet_id not in self._pet_states:
+                    # Load pet data from database
+                    pet_data = get_pet_stats(pet_id)
+                    if not pet_data:
+                        logger.error(f"Failed to load stats for pet {pet_id}")
+                        return None
+                    
+                    # Create new pet state
+                    self._pet_states[pet_id] = PetState(
+                        pet_id=pet_id,
+                        name=pet_data['name'],
+                        species=pet_data['species'],
+                        stats=pet_data['stats']
+                    )
+                
+                return self._pet_states[pet_id]
+                
+        except Exception as e:
+            logger.error(f"Error getting pet state: {e}")
+            logger.error(traceback.format_exc())
+            return None
+        if pet_id not in self.states:
+            # Load initial stats from database or use defaults
+            initial_stats = await self.load_pet_stats(pet_id)
+            self.states[pet_id] = PetState(pet_id, initial_stats)
+        return self.states[pet_id]
+        
+    async def load_pet_stats(self, pet_id: int):
+        """Load pet stats from database"""
+        # Implement database loading logic here
+        # For now, return default stats
+        return {
+            'hunger': 100,
+            'happiness': 100,
+            'energy': 100,
+            'hygiene': 100
+        }
+
+@dataclass
+class InteractionEffect:
+    """Defines the effects and requirements of a pet interaction."""
+    happiness: int
+    hunger: int
+    energy: int
+    hygiene: int
+    cooldown: timedelta
+    conditions: Dict[str, Any]
+    """Thread-safe counter for tracking atomic operations."""
+    def __init__(self):
+        self._value = 0
+        self._lock = asyncio.Lock()
+    
+    async def increment(self) -> int:
+        async with self._lock:
+            self._value += 1
+            return self._value
+    
+    async def get_value(self) -> int:
+        async with self._lock:
+            return self._value
+        class PetStateManager:
+            """Manages individual pet state and handles stat calculations."""
+            def __init__(self, pet_id: int, initial_stats: Dict[str, Any]):
+                """
+                Initialize pet state manager.
+                
+                Args:
+                    pet_id: Unique identifier for the pet
+                    initial_stats: Dictionary containing pet's initial stats
+                """
+                self.pet_id = pet_id
+                self.name = initial_stats['name']
+                self.species = initial_stats['species']
+                self.stats = initial_stats['stats'].copy()
+                self._state = PetState.NORMAL  # Private state variable
+                self._state_lock = asyncio.Lock()  # Lock for state transitions
+                self._stats_lock = asyncio.Lock()  # Lock for stats modifications
+                self.last_update = initial_stats['last_update']
+                self.interaction_history: Dict[InteractionType, datetime] = {}
+                self.treat_count = 0
+                self.last_treat_reset = datetime.now(timezone.utc)
+                self._operation_counter = AtomicCounter()
+                self._pending_changes: Dict[int, Dict[str, Any]] = {}
+                self._last_verified_state: Optional[Dict[str, Any]] = None
+                self._last_persistence_time = datetime.now(timezone.utc)
+                self._lock = asyncio.Lock()  # Add lock attribute
+                def __init__(self, pet_id: int, initial_stats: Dict[str, Any]):
+                    """
+                    Initialize pet state manager.
+                    
+                    Args:
+                        pet_id: Unique identifier for the pet
+                        initial_stats: Dictionary containing pet's initial stats
+                    """
+                    self.pet_id = pet_id
+                    self.name = initial_stats['name']
+                    self.species = initial_stats['species']
+                    self.stats = initial_stats['stats'].copy()
+                    self._state = PetState.NORMAL  # Private state variable
+                    self._state_lock = asyncio.Lock()  # Lock for state transitions
+                    self._stats_lock = asyncio.Lock()  # Lock for stats modifications
+                    self.last_update = initial_stats['last_update']
+                    self.interaction_history: Dict[InteractionType, datetime] = {}
+                    self.treat_count = 0
+                    self.last_treat_reset = datetime.now(timezone.utc)
+                    self._operation_counter = AtomicCounter()
+                    self._pending_changes: Dict[int, Dict[str, Any]] = {}
+                    self._last_verified_state: Optional[Dict[str, Any]] = None
+                    self._last_persistence_time = datetime.now(timezone.utc)
+                    self._lock = asyncio.Lock()  # Add lock attribute
+                    class PetStateManager:
+                        """Initialize the pet state manager."""
+                        self._pet_states = {}
+                        self._lock = asyncio.Lock()
+                    
+                    async def get_pet_state(self, pet_id: int) -> Optional[PetState]:
+                        """Get or create a pet state for the given pet ID."""
+                        try:
+                            async with self._lock:
+                                if pet_id not in self._pet_states:
+                                    # Load pet data from database
+                                    pet_data = get_pet_stats(pet_id)
+                                    if not pet_data:
+                                        logger.error(f"Failed to load stats for pet {pet_id}")
+                                        return None
+                                    
+                                    # Create new pet state
+                                    self._pet_states[pet_id] = PetState(
+                                        pet_id=pet_id,
+                                        name=pet_data['name'],
+                                        species=pet_data['species'],
+                                        stats=pet_data['stats']
+                                    )
+                                
+                                return self._pet_states[pet_id]
+                                
+                        except Exception as e:
+                            logger.error(f"Error getting pet state: {e}")
+                            logger.error(traceback.format_exc())
+class PetState:
+    def __init__(self, pet_id: int, name: str, species: str, stats: Dict[str, int]):
+        """Initialize pet state."""
+        self.pet_id = pet_id
+        self.name = name
+        self.species = species
+        self.stats = stats
+        self._state = PetStatus.NORMAL  # Update to use PetStatus enum
+        self._lock = asyncio.Lock()
+        self.last_update = datetime.now(timezone.utc)
+        self.interaction_history = {}
+    @property
+    def state(self) -> PetStatus:
+        """Get current pet state."""
+        return self._state
+    async def set_state(self, new_state: PetStatus) -> None:
+        """Thread-safe setter for pet state."""
+        async with self._lock:
+            self._state = new_state
+    async def update(self) -> None:
+        """Update pet stats based on time elapsed."""
+        async with self._lock:
+            now = datetime.now(timezone.utc)
+            time_elapsed = (now - self.last_update).total_seconds()
+            
+            # Update stats based on time elapsed (every hour)
+            hours_elapsed = time_elapsed / 3600
+            if hours_elapsed >= 1:
+                # Decrease stats over time
+                self.stats['hunger'] = max(0, self.stats['hunger'] - int(5 * hours_elapsed))
+                self.stats['energy'] = max(0, self.stats['energy'] - int(3 * hours_elapsed))
+                self.stats['hygiene'] = max(0, self.stats['hygiene'] - int(4 * hours_elapsed))
+                self.stats['happiness'] = max(0, self.stats['happiness'] - int(2 * hours_elapsed))
+                
+                # Update state based on stats
+                if self.stats['hygiene'] < 30:
+                    await self.set_state(PetStatus.SICK)
+                elif self.stats['happiness'] < 30:
+                    await self.set_state(PetStatus.UNHAPPY)
+                else:
+                    await self.set_state(PetStatus.NORMAL)
+                
+                self.last_update = now
+class PetStateManager:
+    """Manages pet states and handles stat calculations."""
+    def __init__(self):
+        self._pet_states = {}
+        self._lock = asyncio.Lock()
+        self._operation_counter = AtomicCounter()
+        
+    async def get_pet_state(self, pet_id: int) -> Optional[PetState]:
+        """Get or create a pet state for the given pet ID."""
+        try:
+            async with self._lock:
+                if pet_id not in self._pet_states:
+                    # Load pet data from database
+                    pet_data = get_pet_stats(pet_id)
+                    if not pet_data:
+                        logger.error(f"Failed to load stats for pet {pet_id}")
+                        return None
+                    
+                    # Create new pet state
+                    self._pet_states[pet_id] = PetState(
+                        pet_id=pet_id,
+                        name=pet_data['name'],
+                        species=pet_data['species'],
+                        stats=pet_data['stats']
+                    )
+                
+                return self._pet_states[pet_id]
+                
+        except Exception as e:
+            logger.error(f"Error getting pet state: {e}")
+            logger.error(traceback.format_exc())
+            return None
+        if pet_id not in self.states:
+            # Load initial stats from database or use defaults
+            initial_stats = await self.load_pet_stats(pet_id)
+            self.states[pet_id] = PetState(pet_id, initial_stats)
+        return self.states[pet_id]
+        
+    async def load_pet_stats(self, pet_id: int):
+        """Load pet stats from database"""
+        # Implement database loading logic here
+        # For now, return default stats
+        return {
+            'hunger': 100,
+            'happiness': 100,
+            'energy': 100,
+            'hygiene': 100
+        }
+
+@dataclass
+class InteractionEffect:
+    """Defines the effects and requirements of a pet interaction."""
+    happiness: int
+    hunger: int
+    energy: int
+    hygiene: int
+    cooldown: timedelta
+    conditions: Dict[str, Any]
+    """Thread-safe counter for tracking atomic operations."""
+    def __init__(self):
+        self._value = 0
+        self._lock = asyncio.Lock()
+    
+    async def increment(self) -> int:
+        async with self._lock:
+            self._value += 1
+            return self._value
+    
+    async def get_value(self) -> int:
+        async with self._lock:
+            return self._value
+        class PetStateManager:
+            """Manages individual pet state and handles stat calculations."""
+            def __init__(self, pet_id: int, initial_stats: Dict[str, Any]):
+                """
+                Initialize pet state manager.
+                
+                Args:
+                    pet_id: Unique identifier for the pet
+                    initial_stats: Dictionary containing pet's initial stats
+                """
+                self.pet_id = pet_id
+                self.name = initial_stats['name']
+                self.species = initial_stats['species']
+                self.stats = initial_stats['stats'].copy()
+                self._state = PetState.NORMAL  # Private state variable
+                self._state_lock = asyncio.Lock()  # Lock for state transitions
+                self._stats_lock = asyncio.Lock()  # Lock for stats modifications
+                self.last_update = initial_stats['last_update']
+                self.interaction_history: Dict[InteractionType, datetime] = {}
+                self.treat_count = 0
+                self.last_treat_reset = datetime.now(timezone.utc)
+                self._operation_counter = AtomicCounter()
+                self._pending_changes: Dict[int, Dict[str, Any]] = {}
+                self._last_verified_state: Optional[Dict[str, Any]] = None
+                self._last_persistence_time = datetime.now(timezone.utc)
+                self._lock = asyncio.Lock()  # Add lock attribute
+                def __init__(self, pet_id: int, initial_stats: Dict[str, Any]):
+                    """
+                    Initialize pet state manager.
+                    
+                    Args:
+                        pet_id: Unique identifier for the pet
+                        initial_stats: Dictionary containing pet's initial stats
+                    """
+                    self.pet_id = pet_id
+                    self.name = initial_stats['name']
+                    self.species = initial_stats['species']
+                    self.stats = initial_stats['stats'].copy()
+                    self._state = PetState.NORMAL  # Private state variable
+                    self._state_lock = asyncio.Lock()  # Lock for state transitions
+                    self._stats_lock = asyncio.Lock()  # Lock for stats modifications
+                    self.last_update = initial_stats['last_update']
+                    self.interaction_history: Dict[InteractionType, datetime] = {}
+                    self.treat_count = 0
+                    self.last_treat_reset = datetime.now(timezone.utc)
+                    self._operation_counter = AtomicCounter()
+                    self._pending_changes: Dict[int, Dict[str, Any]] = {}
+                    self._last_verified_state: Optional[Dict[str, Any]] = None
+                    self._last_persistence_time = datetime.now(timezone.utc)
+                    self._lock = asyncio.Lock()  # Add lock attribute
+                    class PetStateManager:
+                        """Initialize the pet state manager."""
+                        self._pet_states = {}
+                        self._lock = asyncio.Lock()
+                    
+                    async def get_pet_state(self, pet_id: int) -> Optional[PetState]:
+                        """Get or create a pet state for the given pet ID."""
+                        try:
+                            async with self._lock:
+                                if pet_id not in self._pet_states:
+                                    # Load pet data from database
+                                    pet_data = get_pet_stats(pet_id)
+                                    if not pet_data:
+                                        logger.error(f"Failed to load stats for pet {pet_id}")
+                                        return None
+                                    
+                                    # Create new pet state
+                                    self._pet_states[pet_id] = PetState(
+                                        pet_id=pet_id,
+                                        name=pet_data['name'],
+                                        species=pet_data['species'],
+                                        stats=pet_data['stats']
+                                    )
+                                
+                                return self._pet_states[pet_id]
+                                
+                        except Exception as e:
+                            logger.error(f"Error getting pet state: {e}")
+                            logger.error(traceback.format_exc())
+class PetState:
+    def __init__(self, pet_id: int, name: str, species: str, stats: Dict[str, int]):
+        """Initialize pet state."""
+        self.pet_id = pet_id
+        self.name = name
+        self.species = species
+        self.stats = stats
+        self._state = PetStatus.NORMAL  # Update to use PetStatus enum
+        self._lock = asyncio.Lock()
+        self.last_update = datetime.now(timezone.utc)
+        self.interaction_history = {}
+    @property
+    def state(self) -> PetStatus:
+        """Get current pet state."""
+        return self._state
+    async def set_state(self, new_state: PetStatus) -> None:
+        """Thread-safe setter for pet state."""
+        async with self._lock:
+            self._state = new_state
+    async def update(self) -> None:
+        """Update pet stats based on time elapsed."""
+        async with self._lock:
+            now = datetime.now(timezone.utc)
+            time_elapsed = (now - self.last_update).total_seconds()
+            
+            # Update stats based on time elapsed (every hour)
+            hours_elapsed = time_elapsed / 3600
+            if hours_elapsed >= 1:
+                # Decrease stats over time
+                self.stats['hunger'] = max(0, self.stats['hunger'] - int(5 * hours_elapsed))
+                self.stats['energy'] = max(0, self.stats['energy'] - int(3 * hours_elapsed))
+                self.stats['hygiene'] = max(0, self.stats['hygiene'] - int(4 * hours_elapsed))
+                self.stats['happiness'] = max(0, self.stats['happiness'] - int(2 * hours_elapsed))
+                
+                # Update state based on stats
+                if self.stats['hygiene'] < 30:
+                    await self.set_state(PetStatus.SICK)
+                elif self.stats['happiness'] < 30:
+                    await self.set_state(PetStatus.UNHAPPY)
+                else:
+                    await self.set_state(PetStatus.NORMAL)
+                
+                self.last_update = now
+class PetStateManager:
+    """Manages pet states and handles stat calculations."""
+    def __init__(self):
+        self._pet_states = {}
+        self._lock = asyncio.Lock()
+        self._operation_counter = AtomicCounter()
+        
+    async def get_pet_state(self, pet_id: int) -> Optional[PetState]:
+        """Get or create a pet state for the given pet ID."""
+        try:
+            async with self._lock:
+                if pet_id not in self._pet_states:
+                    # Load pet data from database
+                    pet_data = get_pet_stats(pet_id)
+                    if not pet_data:
+                        logger.error(f"Failed to load stats for pet {pet_id}")
+                        return None
+                    
+                    # Create new pet state
+                    self._pet_states[pet_id] = PetState(
+                        pet_id=pet_id,
+                        name=pet_data['name'],
+                        species=pet_data['species'],
+                        stats=pet_data['stats']
+                    )
+                
+                return self._pet_states[pet_id]
+                
+        except Exception as e:
+            logger.error(f"Error getting pet state: {e}")
+            logger.error(traceback.format_exc())
+            return None
+        if pet_id not in self.states:
+            # Load initial stats from database or use defaults
+            initial_stats = await self.load_pet_stats(pet_id)
+            self.states[pet_id] = PetState(pet_id, initial_stats)
+        return self.states[pet_id]
+        
+    async def load_pet_stats(self, pet_id: int):
+        """Load pet stats from database"""
+        # Implement database loading logic here
+        # For now, return default stats
+        return {
+            'hunger': 100,
+            'happiness': 100,
+            'energy': 100,
+            'hygiene': 100
+        }
+
+@dataclass
+class InteractionEffect:
+    """Defines the effects and requirements of a pet interaction."""
+    happiness: int
+    hunger: int
+    energy: int
+    hygiene: int
+    cooldown: timedelta
+    conditions: Dict[str, Any]
+    """Thread-safe counter for tracking atomic operations."""
+    def __init__(self):
+        self._value = 0
+        self._lock = asyncio.Lock()
+    
+    async def increment(self) -> int:
+        async with self._lock:
+            self._value += 1
+            return self._value
+    
+    async def get_value(self) -> int:
+        async with self._lock:
+            return self._value
+        class PetStateManager:
+            """Manages individual pet state and handles stat calculations."""
+            def __init__(self, pet_id: int, initial_stats: Dict[str, Any]):
+                """
+                Initialize pet state manager.
+                
+                Args:
+                    pet_id: Unique identifier for the pet
+                    initial_stats: Dictionary containing pet's initial stats
+                """
+                self.pet_id = pet_id
+                self.name = initial_stats['name']
+                self.species = initial_stats['species']
+                self.stats = initial_stats['stats'].copy()
+                self._state = PetState.NORMAL  # Private state variable
+                self._state_lock = asyncio.Lock()  # Lock for state transitions
+                self._stats_lock = asyncio.Lock()  # Lock for stats modifications
+                self.last_update = initial_stats['last_update']
+                self.interaction_history: Dict[InteractionType, datetime] = {}
+                self.treat_count = 0
+                self.last_treat_reset = datetime.now(timezone.utc)
+                self._operation_counter = AtomicCounter()
+                self._pending_changes: Dict[int, Dict[str, Any]] = {}
+                self._last_verified_state: Optional[Dict[str, Any]] = None
+                self._last_persistence_time = datetime.now(timezone.utc)
+                self._lock = asyncio.Lock()  # Add lock attribute
+                def __init__(self, pet_id: int, initial_stats: Dict[str, Any]):
+                    """
+                    Initialize pet state manager.
+                    
+                    Args:
+                        pet_id: Unique identifier for the pet
+                        initial_stats: Dictionary containing pet's initial stats
+                    """
+                    self.pet_id = pet_id
+                    self.name = initial_stats['name']
+                    self.species = initial_stats['species']
+                    self.stats = initial_stats['stats'].copy()
+                    self._state = PetState.NORMAL  # Private state variable
+                    self._state_lock = asyncio.Lock()  # Lock for state transitions
+                    self._stats_lock = asyncio.Lock()  # Lock for stats modifications
+                    self.last_update = initial_stats['last_update']
+                    self.interaction_history: Dict[InteractionType, datetime] = {}
+                    self.treat_count = 0
+                    self.last_treat_reset = datetime.now(timezone.utc)
+                    self._operation_counter = AtomicCounter()
+                    self._pending_changes: Dict[int, Dict[str, Any]] = {}
+                    self._last_verified_state: Optional[Dict[str, Any]] = None
+                    self._last_persistence_time = datetime.now(timezone.utc)
+                    self._lock = asyncio.Lock()  # Add lock attribute
+                    class PetStateManager:
+                        """Initialize the pet state manager."""
+                        self._pet_states = {}
+                        self._lock = asyncio.Lock()
+                    
+                    async def get_pet_state(self, pet_id: int) -> Optional[PetState]:
+                        """Get or create a pet state for the given pet ID."""
+                        try:
+                            async with self._lock:
+                                if pet_id not in self._pet_states:
+                                    # Load pet data from database
+                                    pet_data = get_pet_stats(pet_id)
+                                    if not pet_data:
+                                        logger.error(f"Failed to load stats for pet {pet_id}")
+                                        return None
+                                    
+                                    # Create new pet state
+                                    self._pet_states[pet_id] = PetState(
+                                        pet_id=pet_id,
+                                        name=pet_data['name'],
+                                        species=pet_data['species'],
+                                        stats=pet_data['stats']
+                                    )
+                                
+                                return self._pet_states[pet_id]
+                                
+                        except Exception as e:
+                            logger.error(f"Error getting pet state: {e}")
+                            logger.error(traceback.format_exc())
+class PetState:
+    def __init__(self, pet_id: int, name: str, species: str, stats: Dict[str, int]):
+        """Initialize pet state."""
+        self.pet_id = pet_id
+        self.name = name
+        self.species = species
+        self.stats = stats
+        self._state = PetStatus.NORMAL  # Update to use PetStatus enum
+        self._lock = asyncio.Lock()
+        self.last_update = datetime.now(timezone.utc)
+        self.interaction_history = {}
+    @property
+    def state(self) -> PetStatus:
+        """Get current pet state."""
+        return self._state
+    async def set_state(self, new_state: PetStatus) -> None:
+        """Thread-safe setter for pet state."""
+        async with self._lock:
+            self._state = new_state
+    async def update(self) -> None:
+        """Update pet stats based on time elapsed."""
+        async with self._lock:
+            now = datetime.now(timezone.utc)
+            time_elapsed = (now - self.last_update).total_seconds()
+            
+            # Update stats based on time elapsed (every hour)
+            hours_elapsed = time_elapsed / 3600
+            if hours_elapsed >= 1:
+                # Decrease stats over time
+                self.stats['hunger'] = max(0, self.stats['hunger'] - int(5 * hours_elapsed))
+                self.stats['energy'] = max(0, self.stats['energy'] - int(3 * hours_elapsed))
+                self.stats['hygiene'] = max(0, self.stats['hygiene'] - int(4 * hours_elapsed))
+                self.stats['happiness'] = max(0, self.stats['happiness'] - int(2 * hours_elapsed))
+                
+                # Update state based on stats
+                if self.stats['hygiene'] < 30:
+                    await self.set_state(PetStatus.SICK)
+                elif self.stats['happiness'] < 30:
+                    await self.set_state(PetStatus.UNHAPPY)
+                else:
+                    await self.set_state(PetStatus.NORMAL)
+                
+                self.last_update = now
+class PetStateManager:
+    """Manages pet states and handles stat calculations."""
+    def __init__(self):
+        self._pet_states = {}
+        self._lock = asyncio.Lock()
+        self._operation_counter = AtomicCounter()
+        
+    async def get_pet_state(self, pet_id: int) -> Optional[PetState]:
+        """Get or create a pet state for the given pet ID."""
+        try:
+            async with self._lock:
+                if pet_id not in self._pet_states:
+                    # Load pet data from database
+                    pet_data = get_pet_stats(pet_id)
+                    if not pet_data:
+                        logger.error(f"Failed to load stats for pet {pet_id}")
+                        return None
+                    
+                    # Create new pet state
+                    self._pet_states[pet_id] = PetState(
+                        pet_id=pet_id,
+                        name=pet_data['name'],
+                        species=pet_data['species'],
+                        stats=pet_data['stats']
+                    )
+                
+                return self._pet_states[pet_id]
+                
+        except Exception as e:
+            logger.error(f"Error getting pet state: {e}")
+            logger.error(traceback.format_exc())
+            return None
+        if pet_id not in self.states:
+            # Load initial stats from database or use defaults
+            initial_stats = await self.load_pet_stats(pet_id)
+            self.states[pet_id] = PetState(pet_id, initial_stats)
+        return self.states[pet_id]
+        
+    async def load_pet_stats(self, pet_id: int):
+        """Load pet stats from database"""
+        # Implement database loading logic here
+        # For now, return default stats
+        return {
+            'hunger': 100,
+            'happiness': 100,
+            'energy': 100,
+            'hygiene': 100
+        }
+
+@dataclass
+class InteractionEffect:
+    """Defines the effects and requirements of a pet interaction."""
+    happiness: int
+    hunger: int
+    energy: int
+    hygiene: int
+    cooldown: timedelta
+    conditions: Dict[str, Any]
+    """Thread-safe counter for tracking atomic operations."""
+    def __init__(self):
+        self._value = 0
+        self._lock = asyncio.Lock()
+    
+    async def increment(self) -> int:
+        async with self._lock:
+            self._value += 1
+            return self._value
+    
+    async def get_value(self) -> int:
+        async with self._lock:
+            return self._value
+        class PetStateManager:
+            """Manages individual pet state and handles stat calculations."""
+            def __init__(self, pet_id: int, initial_stats: Dict[str, Any]):
+                """
+                Initialize pet state manager.
+                
+                Args:
+                    pet_id: Unique identifier for the pet
+                    initial_stats: Dictionary containing pet's initial stats
+                """
+                self.pet_id = pet_id
+                self.name = initial_stats['name']
+                self.species = initial_stats['species']
+                self.stats = initial_stats['stats'].copy()
+                self._state = PetState.NORMAL  # Private state variable
+                self._state_lock = asyncio.Lock()  # Lock for state transitions
+                self._stats_lock = asyncio.Lock()  # Lock for stats modifications
+                self.last_update = initial_stats['last_update']
+                self.interaction_history: Dict[InteractionType, datetime] = {}
+                self.treat_count = 0
+                self.last_treat_reset = datetime.now(timezone.utc)
+                self._operation_counter = AtomicCounter()
+                self._pending_changes: Dict[int, Dict[str, Any]] = {}
+                self._last_verified_state: Optional[Dict[str, Any]] = None
+                self._last_persistence_time = datetime.now(timezone.utc)
+                self._lock = asyncio.Lock()  # Add lock attribute
+                def __init__(self, pet_id: int, initial_stats: Dict[str, Any]):
+                    """
+                    Initialize pet state manager.
+                    
+                    Args:
+                        pet_id: Unique identifier for the pet
+                        initial_stats: Dictionary containing pet's initial stats
+                    """
+                    self.pet_id = pet_id
+                    self.name = initial_stats['name']
+                    self.species = initial_stats['species']
+                    self.stats = initial_stats['stats'].copy()
+                    self._state = PetState.NORMAL  # Private state variable
+                    self._state_lock = asyncio.Lock()  # Lock for state transitions
+                    self._stats_lock = asyncio.Lock()  # Lock for stats modifications
+                    self.last_update = initial_stats['last_update']
+                    self.interaction_history: Dict[InteractionType, datetime] = {}
+                    self.treat_count = 0
+                    self.last_treat_reset = datetime.now(timezone.utc)
+                    self._operation_counter = AtomicCounter()
+                    self._pending_changes: Dict[int, Dict[str, Any]] = {}
+                    self._last_verified_state: Optional[Dict[str, Any]] = None
+                    self._last_persistence_time = datetime.now(timezone.utc)
+                    self._lock = asyncio.Lock()  # Add lock attribute
+                    class PetStateManager:
+                        """Initialize the pet state manager."""
+                        self._pet_states = {}
+                        self._lock = asyncio.Lock()
+                    
+                    async def get_pet_state(self, pet_id: int) -> Optional[PetState]:
+                        """Get or create a pet state for the given pet ID."""
+                        try:
+                            async with self._lock:
+                                if pet_id not in self._pet_states:
+                                    # Load pet data from database
+                                    pet_data = get_pet_stats(pet_id)
+                                    if not pet_data:
+                                        logger.error(f"Failed to load stats for pet {pet_id}")
+                                        return None
+                                    
+                                    # Create new pet state
+                                    self._pet_states[pet_id] = PetState(
+                                        pet_id=pet_id,
+                                        name=pet_data['name'],
+                                        species=pet_data['species'],
+                                        stats=pet_data['stats']
+                                    )
+                                
+                                return self._pet_states[pet_id]
+                                
+                        except Exception as e:
+                            logger.error(f"Error getting pet state: {e}")
+                            logger.error(traceback.format_exc())
+class PetState:
+    def __init__(self, pet_id: int, name: str, species: str, stats: Dict[str, int]):
+        """Initialize pet state."""
+        self.pet_id = pet_id
+        self.name = name
+        self.species = species
+        self.stats = stats
+        self._state = PetStatus.NORMAL  # Update to use PetStatus enum
+        self._lock = asyncio.Lock()
+        self.last_update = datetime.now(timezone.utc)
+        self.interaction_history = {}
+    @property
+    def state(self) -> PetStatus:
+        """Get current pet state."""
+        return self._state
+    async def set_state(self, new_state: PetStatus) -> None:
+        """Thread-safe setter for pet state."""
+        async with self._lock:
+            self._state = new_state
+    async def update(self) -> None:
+        """Update pet stats based on time elapsed."""
+        async with self._lock:
+            now = datetime.now(timezone.utc)
+            time_elapsed = (now - self.last_update).total_seconds()
+            
+            # Update stats based on time elapsed (every hour)
+            hours_elapsed = time_elapsed / 3600
+            if hours_elapsed >= 1:
+                # Decrease stats over time
+                self.stats['hunger'] = max(0, self.stats['hunger'] - int(5 * hours_elapsed))
+                self.stats['energy'] = max(0, self.stats['energy'] - int(3 * hours_elapsed))
+                self.stats['hygiene'] = max(0, self.stats['hygiene'] - int(4 * hours_elapsed))
+                self.stats['happiness'] = max(0, self.stats['happiness'] - int(2 * hours_elapsed))
+                
+                # Update state based on stats
+                if self.stats['hygiene'] < 30:
+                    await self.set_state(PetStatus.SICK)
+                elif self.stats['happiness'] < 30:
+                    await self.set_state(PetStatus.UNHAPPY)
+                else:
+                    await self.set_state(PetStatus.NORMAL)
+                
+                self.last_update = now
+class PetStateManager:
+    """Manages pet states and handles stat calculations."""
+    def __init__(self):
+        self._pet_states = {}
+        self._lock = asyncio.Lock()
+        self._operation_counter = AtomicCounter()
+        
+    async def get_pet_state(self, pet_id: int) -> Optional[PetState]:
+        """Get or create a pet state for the given pet ID."""
+        try:
+            async with self._lock:
+                if pet_id not in self._pet_states:
+                    # Load pet data from database
+                    pet_data = get_pet_stats(pet_id)
+                    if not pet_data:
+                        logger.error(f"Failed to load stats for pet {pet_id}")
+                        return None
+                    
+                    # Create new pet state
+                    self._pet_states[pet_id] = PetState(
+                        pet_id=pet_id,
+                        name=pet_data['name'],
+                        species=pet_data['species'],
+                        stats=pet_data['stats']
+                    )
+                
+                return self._pet_states[pet_id]
+                
+        except Exception as e:
+            logger.error(f"Error getting pet state: {e}")
+            logger.error(traceback.format_exc())
+            return None
+        if pet_id not in self.states:
+            # Load initial stats from database or use defaults
+            initial_stats = await self.load_pet_stats(pet_id)
+            self.states[pet_id] = PetState(pet_id, initial_stats)
+        return self.states[pet_id]
+        
+    async def load_pet_stats(self, pet_id: int):
+        """Load pet stats from database"""
+        # Implement database loading logic here
+        # For now, return default stats
+        return {
+            'hunger': 100,
+            'happiness': 100,
+            'energy': 100,
+            'hygiene': 100
+        }
+
+@dataclass
+class InteractionEffect:
+    """Defines the effects and requirements of a pet interaction."""
+    happiness: int
+    hunger: int
+    energy: int
+    hygiene: int
+    cooldown: timedelta
+    conditions: Dict[str, Any]
+    """Thread-safe counter for tracking atomic operations."""
+    def __init__(self):
+        self._value = 0
+        self._lock = asyncio.Lock()
+    
+    async def increment(self) -> int:
+        async with self._lock:
+            self._value += 1
+            return self._value
+    
+    async def get_value(self) -> int:
+        async with self._lock:
+            return self._value
+        class PetStateManager:
+            """Manages individual pet state and handles stat calculations."""
+            def __init__(self, pet_id: int, initial_stats: Dict[str, Any]):
+                """
+                Initialize pet state manager.
+                
+                Args:
+                    pet_id: Unique identifier for the pet
+                    initial_stats: Dictionary containing pet's initial stats
+                """
+                self.pet_id = pet_id
+                self.name = initial_stats['name']
+                self.species = initial_stats['species']
+                self.stats = initial_stats['stats'].copy()
+                self._state = PetState.NORMAL  # Private state variable
+                self._state_lock = asyncio.Lock()  # Lock for state transitions
+                self._stats_lock = asyncio.Lock()  # Lock for stats modifications
+                self.last_update = initial_stats['last_update']
+                self.interaction_history: Dict[InteractionType, datetime] = {}
+                self.treat_count = 0
+                self.last_treat_reset = datetime.now(timezone.utc)
+                self._operation_counter = AtomicCounter()
+                self._pending_changes: Dict[int, Dict[str, Any]] = {}
+                self._last_verified_state: Optional[Dict[str, Any]] = None
+                self._last_persistence_time = datetime.now(timezone.utc)
+                self._lock = asyncio.Lock()  # Add lock attribute
+                def __init__(self, pet_id: int, initial_stats: Dict[str, Any]):
+                    """
+                    Initialize pet state manager.
+                    
+                    Args:
+                        pet_id: Unique identifier for the pet
+                        initial_stats: Dictionary containing pet's initial stats
+                    """
+                    self.pet_id = pet_id
+                    self.name = initial_stats['name']
+                    self.species = initial_stats['species']
+                    self.stats = initial_stats['stats'].copy()
+                    self._state = PetState.NORMAL  # Private state variable
+                    self._state_lock = asyncio.Lock()  # Lock for state transitions
+                    self._stats_lock = asyncio.Lock()  # Lock for stats modifications
+                    self.last_update = initial_stats['last_update']
+                    self.interaction_history: Dict[InteractionType, datetime] = {}
+                    self.treat_count = 0
+                    self.last_treat_reset = datetime.now(timezone.utc)
+                    self._operation_counter = AtomicCounter()
+                    self._pending_changes: Dict[int, Dict[str, Any]] = {}
+                    self._last_verified_state: Optional[Dict[str, Any]] = None
+                    self._last_persistence_time = datetime.now(timezone.utc)
+                    self._lock = asyncio.Lock()  # Add lock attribute
+                    class PetStateManager:
+                        """Initialize the pet state manager."""
+                        self._pet_states = {}
+                        self._lock = asyncio.Lock()
+                    
+                    async def get_pet_state(self, pet_id: int) -> Optional[PetState]:
+                        """Get or create a pet state for the given pet ID."""
+                        try:
+                            async with self._lock:
+                                if pet_id not in self._pet_states:
+                                    # Load pet data from database
+                                    pet_data = get_pet_stats(pet_id)
+                                    if not pet_data:
+                                        logger.error(f"Failed to load stats for pet {pet_id}")
+                                        return None
+                                    
+                                    # Create new pet state
+                                    self._pet_states[pet_id] = PetState(
+                                        pet_id=pet_id,
+                                        name=pet_data['name'],
+                                        species=pet_data['species'],
+                                        stats=pet_data['stats']
+                                    )
+                                
+                                return self._pet_states[pet_id]
+                                
+                        except Exception as e:
+                            logger.error(f"Error getting pet state: {e}")
+                            logger.error(traceback.format_exc())
+class PetState:
+    def __init__(self, pet_id: int, name: str, species: str, stats: Dict[str, int]):
+        """Initialize pet state."""
+        self.pet_id = pet_id
+        self.name = name
+        self.species = species
+        self.stats = stats
+        self._state = PetStatus.NORMAL  # Update to use PetStatus enum
+        self._lock = asyncio.Lock()
+        self.last_update = datetime.now(timezone.utc)
+        self.interaction_history = {}
+    @property
+    def state(self) -> PetStatus:
+        """Get current pet state."""
+        return self._state
+    async def set_state(self, new_state: PetStatus) -> None:
+        """Thread-safe setter for pet state."""
+        async with self._lock:
+            self._state = new_state
+    async def update(self) -> None:
+        """Update pet stats based on time elapsed."""
+        async with self._lock:
+            now = datetime.now(timezone.utc)
+            time_elapsed = (now - self.last_update).total_seconds()
+            
+            # Update stats based on time elapsed (every hour)
+            hours_elapsed = time_elapsed / 3600
+            if hours_elapsed >= 1:
+                # Decrease stats over time
+                self.stats['hunger'] = max(0, self.stats['hunger'] - int(5 * hours_elapsed))
+                self.stats['energy'] = max(0, self.stats['energy'] - int(3 * hours_elapsed))
+                self.stats['hygiene'] = max(0, self.stats['hygiene'] - int(4 * hours_elapsed))
+                self.stats['happiness'] = max(0, self.stats['happiness'] - int(2 * hours_elapsed))
+                
+                # Update state based on stats
+                if self.stats['hygiene'] < 30:
+                    await self.set_state(PetStatus.SICK)
+                elif self.stats['happiness'] < 30:
+                    await self.set_state(PetStatus.UNHAPPY)
+                else:
+                    await self.set_state(PetStatus.NORMAL)
+                
+                self.last_update = now
+class PetStateManager:
+    """Manages pet states and handles stat calculations."""
+    def __init__(self):
+        self._pet_states = {}
+        self._lock = asyncio.Lock()
+        self._operation_counter = AtomicCounter()
+        
+    async def get_pet_state(self, pet_id: int) -> Optional[PetState]:
+        """Get or create a pet state for the given pet ID."""
+        try:
+            async with self._lock:
+                if pet_id not in self._pet_states:
+                    # Load pet data from database
+                    pet_data = get_pet_stats(pet_id)
+                    if not pet_data:
+                        logger.error(f"Failed to load stats for pet {pet_id}")
+                        return None
+                    
+                    # Create new pet state
+                    self._pet_states[pet_id] = PetState(
+                        pet_id=pet_id,
+                        name=pet_data['name'],
+                        species=pet_data['species'],
+                        stats=pet_data['stats']
+                    )
+                
+                return self._pet_states[pet_id]
+                
+        except Exception as e:
+            logger.error(f"Error getting pet state: {e}")
+            logger.error(traceback.format_exc())
+            return None
+        if pet_id not in self.states:
+            # Load initial stats from database or use defaults
+            initial_stats = await self.load_pet_stats(pet_id)
+            self.states[pet_id] = PetState(pet_id, initial_stats)
+        return self.states[pet_id]
+        
+    async def load_pet_stats(self, pet_id: int):
+        """Load pet stats from database"""
+        # Implement database loading logic here
+        # For now, return default stats
+        return {
+            'hunger': 100,
+            'happiness': 100,
+            'energy': 100,
+            'hygiene': 100
+        }
+
+@dataclass
+class InteractionEffect:
+    """Defines the effects and requirements of a pet interaction."""
+    happiness: int
+    hunger: int
+    energy: int
+    hygiene: int
+    cooldown: timedelta
+    conditions: Dict[str, Any]
+    """Thread-safe counter for tracking atomic operations."""
+    def __init__(self):
+        self._value = 0
+        self._lock = asyncio.Lock()
+    
+    async def increment(self) -> int:
+        async with self._lock:
+            self._value += 1
+            return self._value
+    
+    async def get_value(self) -> int:
+        async with self._lock:
+            return self._value
+        class PetStateManager:
+            """Manages individual pet state and handles stat calculations."""
+            def __init__(self, pet_id: int, initial_stats: Dict[str, Any]):
+                """
+                Initialize pet state manager.
+                
+                Args:
+                    pet_id: Unique identifier for the pet
+                    initial_stats: Dictionary containing pet's initial stats
+                """
+                self.pet_id = pet_id
+                self.name = initial_stats['name']
+                self.species = initial_stats['species']
+                self.stats = initial_stats['stats'].copy()
+                self._state = PetState.NORMAL  # Private state variable
+                self._state_lock = asyncio.Lock()  # Lock for state transitions
+                self._stats_lock = asyncio.Lock()  # Lock for stats modifications
+                self.last_update = initial_stats['last_update']
+                self.interaction_history: Dict[InteractionType, datetime] = {}
+                self.treat_count = 0
+                self.last_treat_reset = datetime.now(timezone.utc)
+                self._operation_counter = AtomicCounter()
+                self._pending_changes: Dict[int, Dict[str, Any]] = {}
+                self._last_verified_state: Optional[Dict[str, Any]] = None
+                self._last_persistence_time = datetime.now(timezone.utc)
+                self._lock = asyncio.Lock()  # Add lock attribute
+                def __init__(self, pet_id: int, initial_stats: Dict[str, Any]):
+                    """
+                    Initialize pet state manager.
+                    
+                    Args:
+                        pet_id: Unique identifier for the pet
+                        initial_stats: Dictionary containing pet's initial stats
+                    """
+                    self.pet_id = pet_id
+                    self.name = initial_stats['name']
+                    self.species = initial_stats['species']
+                    self.stats = initial_stats['stats'].copy()
+                    self._state = PetState.NORMAL  # Private state variable
+                    self._state_lock = asyncio.Lock()  # Lock for state transitions
+                    self._stats_lock = asyncio.Lock()  # Lock for stats modifications
+                    self.last_update = initial_stats['last_update']
+                    self.interaction_history: Dict[InteractionType, datetime] = {}
+                    self.treat_count = 0
+                    self.last_treat_reset = datetime.now(timezone.utc)
+                    self._operation_counter = AtomicCounter()
+                    self._pending_changes: Dict[int, Dict[str, Any]] = {}
+                    self._last_verified_state: Optional[Dict[str, Any]] = None

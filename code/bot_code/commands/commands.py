@@ -7,7 +7,7 @@ import traceback
 from typing import Optional
 from datetime import datetime, timezone
 
-from game.state import StateManager, PetState, InteractionType
+from game.state import PetStateManager, PetState, InteractionType
 from game.views import PetView
 from database.database import create_pet, execute_query
 
@@ -35,9 +35,9 @@ class TomibotchiCommands(commands.Cog):
     def __init__(self, bot: commands.Bot):
         print("DEBUG: Initializing TomibotchiCommands")
         self.bot = bot
-        self.state_manager = StateManager()
-        self.valid_species = {'cat', 'dog', 'rabbit', 'hamster'}
-        self.pet_limit = 3  # Default pet limit for regular users
+        self.state_manager = PetStateManager()  # Remove pet_id and initial_stats as they're managed per pet
+        self.valid_species = {'cat', 'dog'} #, 'rabbit', 'hamster'}
+        self.pet_limit = 2  # Default pet limit for regular users
         print("DEBUG: TomibotchiCommands initialized")
     
     @commands.Cog.listener()
@@ -45,12 +45,12 @@ class TomibotchiCommands(commands.Cog):
         """Log when commands are ready"""
         print("DEBUG: TomibotchiCommands Cog is ready!")
         print("DEBUG: Available commands:", [command.name for command in self.get_cog_commands()])
-
+        print("Bot has completed boot up sequence.")
+    
     def get_cog_commands(self):
         """Get list of commands in this cog"""
         return [command for command in self.bot.get_cog('TomibotchiCommands').get_commands()]
-
-
+    
     async def validate_pet_name(self, name: str) -> bool:
         """
         Validate pet name.
@@ -80,7 +80,7 @@ class TomibotchiCommands(commands.Cog):
             None, execute_query, query, (user_id,)
         )
         return result[0][0] if result else 0
-
+    
     @commands.command()
     @commands.cooldown(1, 60, commands.BucketType.user)
     async def create(self, ctx: commands.Context, name: str, species: str):
@@ -131,7 +131,7 @@ class TomibotchiCommands(commands.Cog):
                     
                 view = PetView(pet_state, self.bot)
                 embed = await view.create_status_embed()
-                
+                    
                 # Send initial message
                 view.message = await ctx.send(
                     embed=embed,
@@ -148,8 +148,7 @@ class TomibotchiCommands(commands.Cog):
                     title="❌ Invalid Pet Name",
                     description=str(e),
                     color=discord.Color.red()
-                ),
-                ephemeral=True
+                )
             )
         except PetLimitReached:
             await ctx.send(
@@ -157,22 +156,16 @@ class TomibotchiCommands(commands.Cog):
                     title="❌ Pet Limit Reached",
                     description="You can only have 3 pets! Support us for more slots!",
                     color=discord.Color.red()
-                ),
-                ephemeral=True
+                )
             )
         except Exception as e:
-            logger.error(f"Error creating pet: {e}")
+            logger.error(f"Error creating pet: {e} tb: {traceback.format_exc()}")
             logger.error(traceback.format_exc())
             await ctx.send("❌ An error occurred creating your pet!")
-
     @commands.command()
     @commands.cooldown(1, 5, commands.BucketType.user)
     async def show(self, ctx: commands.Context, pet_name: Optional[str] = None):
-        """
-        Display your pet's status.
-        
-        Usage: !show [pet_name]
-        """
+        """Display your pet's status."""
         try:
             # Get user's pets
             query = """
@@ -180,6 +173,7 @@ class TomibotchiCommands(commands.Cog):
                 WHERE user_id = %s AND active = TRUE
                 ORDER BY creation_date DESC
             """
+            logger.info(f"Fetching pets for user {ctx.author.id}")  # Added logging
             result = await self.bot.loop.run_in_executor(
                 None, execute_query, query, (ctx.author.id,)
             )
@@ -201,24 +195,25 @@ class TomibotchiCommands(commands.Cog):
             else:
                 pet_id = result[0][0]
             
+            logger.info(f"Loading pet state for pet_id: {pet_id}")  # Added logging
             # Show pet status
-            async with self.state_manager.get_pet_state(pet_id) as pet_state:
-                if not pet_state:
-                    raise PetError("Failed to load pet state")
-                    
-                view = PetView(pet_state, self.bot)
-                embed = await view.create_status_embed()
+            pet_state = await self.state_manager.get_pet_state(pet_id)
+            if not pet_state:
+                raise PetError(f"Failed to load state for pet {pet_id}")
                 
-                view.message = await ctx.send(
-                    embed=embed,
-                    view=view
-                )
+            view = PetView(pet_state, self.bot)
+            embed = await view.create_status_embed()  # Unpack both embed and file
+                
+            # Send both embed and file together
+            view.message = await ctx.send(
+                embed=embed,
+                view=view
+            )
                 
         except Exception as e:
             logger.error(f"Error showing pet: {e}")
-            logger.error(traceback.format_exc())
+            logger.error(f"Full traceback: {traceback.format_exc()}")
             await ctx.send("❌ An error occurred showing your pet!")
-
     @commands.command()
     @commands.cooldown(1, 300, commands.BucketType.user)
     async def rename(self, ctx: commands.Context, pet_name: str, new_name: str):
@@ -277,14 +272,12 @@ class TomibotchiCommands(commands.Cog):
                     title="❌ Invalid Pet Name",
                     description=str(e),
                     color=discord.Color.red()
-                ),
-                ephemeral=True
+                )
             )
         except Exception as e:
             logger.error(f"Error renaming pet: {e}")
             logger.error(traceback.format_exc())
             await ctx.send("❌ An error occurred renaming your pet!")
-
     @commands.command()
     @commands.cooldown(1, 10, commands.BucketType.user)
     async def info(self, ctx: commands.Context):
@@ -333,7 +326,6 @@ class TomibotchiCommands(commands.Cog):
         )
         
         await ctx.send(embed=embed)
-
     @commands.command()
     @commands.cooldown(1, 5, commands.BucketType.user)
     async def stats(self, ctx: commands.Context, pet_name: Optional[str] = None):
@@ -420,7 +412,6 @@ class TomibotchiCommands(commands.Cog):
             logger.error(f"Error showing pet stats: {e}")
             logger.error(traceback.format_exc())
             await ctx.send("❌ An error occurred showing pet stats!")
-
     @commands.command()
     @commands.has_permissions(administrator=True)
     async def reset(self, ctx: commands.Context, user: discord.Member):
@@ -459,7 +450,6 @@ class TomibotchiCommands(commands.Cog):
             logger.error(f"Error resetting pet data: {e}")
             logger.error(traceback.format_exc())
             await ctx.send("❌ An error occurred resetting pet data!")
-
     @commands.command()
     @commands.has_permissions(administrator=True)
     async def configure(self, ctx: commands.Context, setting: str, value: str):
@@ -532,7 +522,6 @@ class TomibotchiCommands(commands.Cog):
             logger.error(f"Error configuring settings: {e}")
             logger.error(traceback.format_exc())
             await ctx.send("❌ An error occurred updating settings!")
-
     @commands.command()
     @commands.cooldown(1, 10, commands.BucketType.user)
     async def tutorial(self, ctx: commands.Context):
@@ -581,7 +570,6 @@ class TomibotchiCommands(commands.Cog):
         )
         
         await ctx.send(embed=embed)
-
     @commands.Cog.listener()
     async def on_command_error(self, ctx: commands.Context, error: Exception):
         """Global error handler for commands"""
@@ -592,8 +580,7 @@ class TomibotchiCommands(commands.Cog):
                     title="⏳ Slow Down!",
                     description=f"Try again in {error.retry_after:.1f}s",
                     color=discord.Color.red()
-                ),
-                ephemeral=True
+                )
             )
             
         elif isinstance(error, commands.MissingPermissions):
@@ -602,8 +589,7 @@ class TomibotchiCommands(commands.Cog):
                     title="❌ Missing Permissions",
                     description="You don't have permission to use this command!",
                     color=discord.Color.red()
-                ),
-                ephemeral=True
+                )
             )
             
         elif isinstance(error, commands.MissingRequiredArgument):
@@ -612,8 +598,7 @@ class TomibotchiCommands(commands.Cog):
                     title="❌ Missing Arguments",
                     description=f"Missing required argument: {error.param.name}",
                     color=discord.Color.red()
-                ),
-                ephemeral=True
+                )
             )
             
         else:
@@ -624,10 +609,8 @@ class TomibotchiCommands(commands.Cog):
                     title="❌ Error",
                     description="An unexpected error occurred!",
                     color=discord.Color.red()
-                ),
-                ephemeral=True
+                )
             )
-
     async def _cleanup_task(self):
         """Background task to clean up stale pet states"""
         try:
@@ -637,7 +620,6 @@ class TomibotchiCommands(commands.Cog):
         except Exception as e:
             logger.error(f"Error in cleanup task: {e}")
             logger.error(traceback.format_exc())
-
     @commands.Cog.listener()
     async def on_guild_join(self, guild: discord.Guild):
         """Initialize settings when bot joins a new guild"""
@@ -680,7 +662,6 @@ class TomibotchiCommands(commands.Cog):
         except Exception as e:
             logger.error(f"Error cleaning up guild {guild.id}: {e}")
             logger.error(traceback.format_exc())
-
     def cog_unload(self):
         """Cleanup when cog is unloaded"""
         # Cancel background tasks
@@ -690,21 +671,8 @@ class TomibotchiCommands(commands.Cog):
         self.bot.loop.create_task(self.state_manager.update_all())
         logger.info("Tomibotchi commands unloaded")
 
-async def setup(bot: commands.Bot) -> None:
-    """Setup function for the commands cog"""
-    if not bot:
-        raise ValueError("Bot instance cannot be None")
-        
-    try:
-        # Create cog instance
-        cog = TomibotchiCommands(bot)
-        
-        # Add cog to bot
-        await bot.add_cog(cog)
-        logger.info("Successfully added TomibotchiCommands cog")
-        
-    except Exception as e:
-        logger.error(f"Failed to setup TomibotchiCommands: {e}")
-        logger.error(traceback.format_exc())
-        raise
-
+def setup(bot):
+    """Add the cog to the bot."""
+    cog = TomibotchiCommands(bot)
+    bot.add_cog(cog)
+    print("DEBUG: TomibotchiCommands cog added to bot")

@@ -24,10 +24,21 @@ logger = logging.getLogger(__name__)
 
 def get_config():
     config_path = os.path.join(os.path.dirname(__file__), '..', '..', 'assets', 'config.json')
-    config_path = os.path.abspath(config_path)
-    with open(config_path, 'r') as f:
-        config = json.load(f)
-    return config
+    print(f"Loading config from: {config_path}")  # Enhanced debug message
+    try:
+        with open(config_path, 'r') as f:
+            config = json.load(f)
+            print(f"Config loaded successfully: {list(config.keys())}")  # Debug loaded config
+            return config
+    except FileNotFoundError:
+        logger.error(f"Config file not found at {config_path}")
+        raise
+    except json.JSONDecodeError as e:
+        logger.error(f"Invalid JSON in config file: {e}")
+        raise
+    except Exception as e:
+        logger.error(f"Unexpected error loading config: {e}")
+        raise
 
 # Load the config file and set the paused games list as a global variables 
 config = get_config()

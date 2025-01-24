@@ -1,7 +1,7 @@
 from __future__ import annotations
 import asyncio
 import logging
-from typing import Optional, Dict, List
+from typing import Optional, Dict, List, Tuple
 from datetime import datetime, timezone
 import traceback
 
@@ -13,7 +13,7 @@ from nextcord.ui import Button, View
 from utils.sprite_handler import SpriteHandler
 
 from .state import (
-    PetStateManager, PetState, InteractionType,
+    PetStateManager, PetState, PetStatus, InteractionType, InteractionEffect,
     INTERACTION_EFFECTS
 )
 
@@ -22,12 +22,11 @@ logger = logging.getLogger(__name__)
 
 # Define color schemes for different pet states
 STATE_COLORS = {
-    PetState.NORMAL: discord.Color.green(),
-    PetState.SLEEPING: discord.Color.blue(),
-    PetState.SICK: discord.Color.red(),
-    PetState.UNHAPPY: discord.Color.gold()
+    PetStatus.NORMAL: discord.Color.green(),
+    PetStatus.SLEEPING: discord.Color.blue(),
+    PetStatus.SICK: discord.Color.red(),
+    PetStatus.UNHAPPY: discord.Color.gold()
 }
-
 def create_progress_bar(value: int, max_value: int = 100, length: int = 10) -> str:
     """
     Creates a visual progress bar for stats.
@@ -45,7 +44,7 @@ def create_progress_bar(value: int, max_value: int = 100, length: int = 10) -> s
     bar = '█' * filled + '░' * empty
     return f"{bar} {value}%"
 
-def get_pet_image(pet_state: PetStateManager) -> str:
+async def get_pet_image(pet_state: PetStateManager) -> str:
     """
     Gets appropriate pet image URL based on pet state.
     
@@ -56,9 +55,9 @@ def get_pet_image(pet_state: PetStateManager) -> str:
         URL string for pet image
     """
     # Base image path format: assets/{species}_{state}.png
-    base_path = f"assets/{pet_state.species.lower()}"
-    state = pet_state.state.value
-    return f"{base_path}_{state}.png"
+    base_path = f"assets/{pet_state.species.lower()}/{pet_state.species.lower()}"
+    current_state = pet_state.state
+    return f"{base_path}-{current_state.value}.png"
 
 def format_cooldown(seconds: float) -> str:
     """
@@ -82,31 +81,44 @@ def format_cooldown(seconds: float) -> str:
 
 class InteractionButton(Button):
     """Button for pet interactions with cooldown and state management."""
-    
-    def __init__(self, 
-                 interaction_type: InteractionType,
-                 style: ButtonStyle,
-                 view: PetView):
-        """
-        Initialize interaction button.
-        
-        Args:
-            interaction_type: Type of interaction this button triggers
-            style: Button style from discord.ButtonStyle
-            view: Parent PetView instance
-        """
+    def __init__(
+        self,
+        interaction_type: InteractionType,
+        style: ButtonStyle,
+        pet_view: 'PetView'  # Forward reference for type hint
+    ):
         self.interaction_type = interaction_type
-        self.view: PetView = view
+        self.pet_view = pet_view
         self.effect = INTERACTION_EFFECTS[interaction_type]
         
-        # Configure button appearance
+        # Add unique identifier using pet_id to prevent duplicates
+        custom_id = f"pet_interaction_{interaction_type.value}_{pet_view.pet_state.pet_id}"
+        
         super().__init__(
             style=style,
             label=interaction_type.value.title(),
-            custom_id=f"pet_interaction_{interaction_type.value}",
-            row=self._get_button_row()
+            custom_id=custom_id
         )
-    
+
+    async def callback(self, interaction: discord.Interaction):
+        try:
+            await interaction.response.defer()
+            success, message = await self.pet_view.pet_state.process_interaction(
+                self.interaction_type
+            )
+            
+            if success:
+                await self.pet_view.update_display(interaction)
+                await interaction.followup.send(f"✅ {message}", ephemeral=True)
+            else:
+                await interaction.followup.send(f"❌ {message}", ephemeral=True)
+        except Exception as e:
+            logger.error(f"Error processing interaction {self.interaction_type}: {e}")
+            logger.error(traceback.format_exc())
+            await interaction.followup.send(
+                "❌ An error occurred processing your interaction!",
+                ephemeral=True
+            )
     def _get_button_row(self) -> int:
         """Determines button row based on interaction type."""
         interaction_rows = {
@@ -121,46 +133,6 @@ class InteractionButton(Button):
             InteractionType.MEDICINE: 4
         }
         return interaction_rows.get(self.interaction_type, 0)
-
-    async def callback(self, interaction: discord.Interaction):
-        """
-        Handle button press event.
-        
-        Args:
-            interaction: Discord interaction event
-        """
-        try:
-            # Defer response to show loading state
-            await interaction.response.defer()
-            
-            # Process interaction
-            success, message = await self.view.pet_state.process_interaction(
-                self.interaction_type
-            )
-            
-            if success:
-                # Update display with new state
-                await self.view.update_display(interaction)
-                await interaction.followup.send(
-                    f"✅ {message}",
-                    ephemeral=True
-                )
-            else:
-                # Show error message
-                await interaction.followup.send(
-                    f"❌ {message}",
-                    ephemeral=True
-                )
-                
-        except Exception as e:
-            logger.error(
-                f"Error processing interaction {self.interaction_type}: {e}"
-            )
-            logger.error(traceback.format_exc())
-            await interaction.followup.send(
-                "❌ An error occurred processing your interaction!",
-                ephemeral=True
-            )
 
 class PetView(View):
     """Main view for pet display and interactions."""
@@ -183,7 +155,7 @@ class PetView(View):
         self.start_update_loop()
 
     def setup_buttons(self):
-        """Configure and add interaction buttons."""
+        """Set up interaction buttons."""
         button_styles = {
             InteractionType.FEED: ButtonStyle.green,
             InteractionType.CLEAN: ButtonStyle.blurple,
@@ -197,116 +169,103 @@ class PetView(View):
         }
         
         for interaction_type, style in button_styles.items():
-            self.add_item(InteractionButton(
+            button = InteractionButton(
                 interaction_type=interaction_type,
                 style=style,
-                view=self
-            ))
-
-    async def create_status_embed(self) -> discord.Embed:
+                pet_view=self
+            )
+            self.add_item(button)
+    def _get_active_effects(self) -> List[str]:
         """
-        Creates pet status embed with current stats.
+        Gets list of active effects on the pet.
         
         Returns:
-            Discord embed object with pet status
+            List of formatted strings describing active effects
         """
-        # Get current state
-        current_state = await self.pet_state.state
+        active_effects = []
         
-        embed = discord.Embed(
-            title=f"{self.pet_state.name} the {self.pet_state.species}",
-            description="Your virtual pet!",
-            color=STATE_COLORS[current_state],
-            timestamp=datetime.now(timezone.utc)
-        )
-        
-        # Add status field
-        time_ago = format_cooldown(
-            (datetime.now(timezone.utc) - self.pet_state.last_update)
-            .total_seconds()
-        )
-        
-        embed.add_field(
-            name="Status",
-            value=f"Currently: {current_state.value}\n"
-                  f"Last interaction: {time_ago} ago",
-            inline=False
-        )
-        
-        # Add stats with progress bars
-        stats_text = []
-        for stat, value in self.pet_state.stats.items():
-            icon = {
-                'happiness': '❤️',
-                'hunger': '🍖',
-                'energy': '⚡',
-                'hygiene': '✨'
-            }.get(stat, '📊')
+        # Add status-based effects
+        if self.pet_state.state == PetStatus.SLEEPING:
+            active_effects.append("💤 Sleeping - Energy recovery increased")
+        elif self.pet_state.state == PetStatus.SICK:
+            active_effects.append("🤒 Sick - Stats decay faster")
+        elif self.pet_state.state == PetStatus.UNHAPPY:
+            active_effects.append("😢 Unhappy - Needs attention")
             
-            stats_text.append(
-                f"{icon} {stat.title()}: {create_progress_bar(value)}"
+        return active_effects
+    async def create_status_embed(self) -> discord.Embed:
+        """Creates pet status embed with current stats."""
+        try:
+            # Get current state
+            current_state = self.pet_state.state
+            
+            # Get sprite URL
+            sprite_url = await self.sprite_handler.get_sprite_url(
+                self.pet_state.species,
+                self.pet_state.state
             )
-        
-        embed.add_field(
-            name="Stats",
-            value='\n'.join(stats_text),
-            inline=False
-        )
-        
-        # Add active effects
-        active_effects = self._get_active_effects()
-        if active_effects:
+            
+            embed = discord.Embed(
+                title=f"{self.pet_state.name} the {self.pet_state.species}",
+                description="Your virtual pet!",
+                color=STATE_COLORS[current_state],
+                timestamp=datetime.now(timezone.utc)
+            )
+            
+            # Set the sprite as the embed's image
+            if sprite_url:
+                embed.set_image(url=sprite_url)
+            
+            # Add status field
+            time_ago = format_cooldown(
+                (datetime.now(timezone.utc) - self.pet_state.last_update)
+                .total_seconds()
+            )
+            
             embed.add_field(
-                name="Active Effects",
-                value='\n'.join(active_effects),
+                name="Status",
+                value=f"Currently: {current_state.value}\n"
+                      f"Last interaction: {time_ago} ago",
                 inline=False
             )
-        
-        # Set pet image
-        embed.set_thumbnail(url=get_pet_image(self.pet_state))
-        embed.set_footer(text="Updated just now")
-        
-        # Create pet animation
-        pet_gif = await self.sprite_handler.create_pet_gif(
-            self.pet_state.species,
-            self.pet_state.state.value
-        )
-
-        # Add file to embed
-        file = discord.File(pet_gif, filename="pet.gif")
-        embed.set_image(url="attachment://pet.gif")
-
-        return embed, file
-    
-    async def update_display(self):
-        embed, file = await self.create_status_embed()
-        await self.message.edit(embed=embed, file=file)
-
-    def _get_active_effects(self) -> List[str]:
-        """Gets list of active effects and cooldowns."""
-        effects = []
-        now = datetime.now(timezone.utc)
-        
-        for interaction_type, last_time in self.pet_state.interaction_history.items():
-            cooldown = INTERACTION_EFFECTS[interaction_type].cooldown
-            time_elapsed = (now - last_time).total_seconds()
             
-            if time_elapsed < cooldown.total_seconds():
-                remaining = cooldown.total_seconds() - time_elapsed
-                effects.append(
-                    f"🕒 {interaction_type.value.title()} "
-                    f"cooldown: {format_cooldown(remaining)}"
+            # Add stats with progress bars
+            stats_text = []
+            for stat, value in self.pet_state.stats.items():
+                icon = {
+                    'happiness': '❤️',
+                    'hunger': '🍖',
+                    'energy': '⚡',
+                    'hygiene': '✨'
+                }.get(stat, '📊')
+                
+                stats_text.append(
+                    f"{icon} {stat.title()}: {create_progress_bar(value)}"
                 )
-        
-        return effects
-
+            
+            embed.add_field(
+                name="Stats",
+                value='\n'.join(stats_text),
+                inline=False
+            )
+            
+            # Get and add active effects
+            active_effects = self._get_active_effects()
+            if active_effects:
+                embed.add_field(
+                    name="Active Effects",
+                    value='\n'.join(active_effects),
+                    inline=False
+                )
+            
+            return embed
+            
+        except Exception as e:
+            logger.error(f"Error creating status embed: {e}")
+            logger.error(traceback.format_exc())
+            raise
     async def update_display(self, interaction: Optional[discord.Interaction] = None):
-        """
-        Updates the pet display.
-        
-        Args:
-            interaction: Optional interaction to respond to
-        """
+        """Updates the pet display."""
         async with self._lock:
             try:
                 # Update pet state
@@ -316,13 +275,16 @@ class PetView(View):
                 embed = await self.create_status_embed()
                 
                 # Update message
-                if interaction and self.message:
+                if interaction:
                     await interaction.edit_original_response(
                         embed=embed,
                         view=self
                     )
                 elif self.message:
-                    await self.message.edit(embed=embed, view=self)
+                    await self.message.edit(
+                        embed=embed,
+                        view=self
+                    )
                     
             except Exception as e:
                 logger.error(f"Error updating display: {e}")
@@ -333,7 +295,13 @@ class PetView(View):
                         "❌ Failed to update display!",
                         ephemeral=True
                     )
-
+                elif self.message:
+                    try:
+                        await self.message.edit(embed=embed, view=self)
+                    except Exception as e:
+                        logger.error(f"Error in fallback message edit: {e}")
+                        logger.error(traceback.format_exc())
+                        
     def start_update_loop(self):
         """Starts the automatic update loop."""
         self.update_loop.start()

@@ -133,6 +133,7 @@ def execute_query(
     for attempt in range(retry_attempts):
         connection = None
         cursor = None
+        print("Connecting to DB with request")
         try:
             connection = pool.get_connection()
             cursor = connection.cursor()
@@ -142,9 +143,11 @@ def execute_query(
             if commit:
                 connection.commit()
                 
+            if query.strip().upper().startswith('INSERT'):
+                return cursor.lastrowid
+                
             result = cursor.fetchall() if cursor.description else True
             return result
-
         except mysql.connector.Error as error:
             last_error = error
             logger.warning(
@@ -246,86 +249,81 @@ def create_tables() -> None:
 
 # Pet-related database functions
 def create_pet(user_id: int, guild_id: int, name: str, species: str) -> Optional[int]:
-    """
-    Creates a new pet for a user.
-    
-    Args:
-        user_id: Discord user ID
-        guild_id: Discord guild ID
-        name: Pet name
-        species: Pet species
-        
-    Returns:
-        int: New pet ID if successful, None if failed
-    """
+    """Creates a new pet and initializes its stats."""
     try:
-        # First ensure guild exists
-        guild_query = """
-            INSERT IGNORE INTO guild_settings (guild_id)
-            VALUES (%s)
-        """
-        execute_query(guild_query, (guild_id,), commit=True)
-        
-        # Create pet
-        pet_query = """
-            INSERT INTO pets (user_id, guild_id, name, species)
-            VALUES (%s, %s, %s, %s)
-        """
-        execute_query(pet_query, (user_id, guild_id, name, species), commit=True)
-        
-        # Get new pet ID
-        id_query = "SELECT LAST_INSERT_ID()"
-        result = execute_query(id_query)
-        pet_id = result[0][0] if result else None
-        
-        # Initialize pet stats
-        if pet_id:
+        with lock:
+            # Create pet entry
+            pet_query = """
+                INSERT INTO pets (user_id, guild_id, name, species)
+                VALUES (%s, %s, %s, %s)
+            """
+            pet_id = execute_query(
+                pet_query, 
+                (user_id, guild_id, name, species), 
+                commit=True
+            )
+            
+            if not pet_id:
+                logger.error("Failed to create pet entry")
+                return None
+                
+            # Initialize pet stats
             stats_query = """
-                INSERT INTO pet_stats (pet_id)
-                VALUES (%s)
+                INSERT INTO pet_stats (pet_id, happiness, hunger, energy, hygiene, last_update)
+                VALUES (%s, 100, 100, 100, 100, UTC_TIMESTAMP())
             """
             execute_query(stats_query, (pet_id,), commit=True)
             
-        return pet_id
-        
+            # Update user data
+            user_query = """
+                INSERT INTO user_data (user_id, username, total_pets)
+                VALUES (%s, %s, 1)
+                ON DUPLICATE KEY UPDATE 
+                total_pets = total_pets + 1
+            """
+            execute_query(user_query, (user_id, str(user_id)), commit=True)
+            
+            return pet_id
+            
     except Exception as e:
-        logger.error(f"Error creating pet: {e}")
+        logger.error(f"Database error creating pet: {e}")
         logger.error(traceback.format_exc())
         return None
 
+
 def get_pet_stats(pet_id: int) -> Optional[Dict[str, Any]]:
-    """
-    Gets current stats for a pet.
-    
-    Args:
-        pet_id: Pet ID to query
-        
-    Returns:
-        dict: Pet stats or None if not found
-    """
-    query = """
-        SELECT p.name, p.species, ps.happiness, ps.hunger, 
-               ps.energy, ps.hygiene, ps.last_update
-        FROM pets p
-        JOIN pet_stats ps ON p.pet_id = ps.pet_id
-        WHERE p.pet_id = %s AND p.active = TRUE
-    """
+    """Gets current stats for a pet."""
     try:
+        query = """
+            SELECT p.name, p.species, ps.happiness, ps.hunger, 
+                   ps.energy, ps.hygiene, ps.last_update
+            FROM pets p
+            JOIN pet_stats ps ON p.pet_id = ps.pet_id
+            WHERE p.pet_id = %s AND p.active = TRUE
+        """
         result = execute_query(query, (pet_id,))
-        if result and result[0]:
-            name, species, happiness, hunger, energy, hygiene, last_update = result[0]
-            return {
-                'name': name,
-                'species': species,
-                'stats': {
-                    'happiness': happiness,
-                    'hunger': hunger,
-                    'energy': energy,
-                    'hygiene': hygiene
-                },
-                'last_update': last_update
-            }
-        return None
+        
+        if not result or not result[0]:
+            logger.error(f"No stats found for pet {pet_id}")
+            return None
+            
+        name, species, happiness, hunger, energy, hygiene, last_update = result[0]
+        
+        # Ensure all stats are within valid range
+        stats = {
+            'happiness': max(0, min(100, happiness or 100)),
+            'hunger': max(0, min(100, hunger or 100)),
+            'energy': max(0, min(100, energy or 100)),
+            'hygiene': max(0, min(100, hygiene or 100))
+        }
+        
+        return {
+            'name': name,
+            'species': species,
+            'stats': stats,
+            'last_update': last_update or datetime.now(timezone.utc)
+        }
+        
     except Exception as e:
         logger.error(f"Error getting pet stats: {e}")
         logger.error(traceback.format_exc())
