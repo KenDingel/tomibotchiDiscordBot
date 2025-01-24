@@ -1,0 +1,4 @@
+
+code/assets/config.json
+*.pyc
+*.log

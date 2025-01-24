@@ -1,0 +1,23 @@
+# Discord API
+nextcord>=2.0.0
+
+# Database
+mysql-connector-python>=8.0.0
+
+# Async Support
+aiohttp>=3.8.0
+asyncio>=3.4.3
+
+# Date/Time Handling
+pytz>=2023.3
+
+# Utilities
+python-dotenv>=1.0.0
+typing-extensions>=4.5.0
+
+# Development & Testing
+pytest>=7.0.0
+pytest-asyncio>=0.21.0
+pytest-cov>=4.1.0
+black>=23.3.0
+flake8>=6.0.0
